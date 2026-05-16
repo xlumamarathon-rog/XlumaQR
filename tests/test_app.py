@@ -446,3 +446,160 @@ def test_batch_prefix_with_leading_dot_returns_400(client) -> None:
         assert rv.status_code == 400, f"{prefix!r} should be rejected"
         body = rv.get_json()
         assert body is not None and "error" in body
+
+
+# --- Streaming batch endpoint ---------------------------------------
+#
+# The new ``POST /api/qr/batch/stream`` route returns ``application/x-ndjson``.
+# The event ordering it guarantees, and that the tests below assert on, is:
+#
+#   1. exactly one ``start`` event with ``total = N``,
+#   2. exactly N ``progress`` events with ``index`` running 0..N-1
+#      monotonically and ``total = N`` on every one,
+#   3. exactly one terminal ``result`` event whose ``data_base64`` decodes
+#      to a valid ZIP (starting with ``PK``) or PDF (starting with ``%PDF-``).
+#
+# On a validation failure the route never enters streaming mode and
+# instead returns a normal JSON 400, identical in shape to ``/api/qr/batch``.
+
+
+def _parse_ndjson(body: bytes) -> list[dict]:
+    """Split a streamed NDJSON body into a list of parsed events."""
+    import json as _json
+
+    events: list[dict] = []
+    for line in body.split(b"\n"):
+        if not line:
+            continue
+        events.append(_json.loads(line.decode("utf-8")))
+    return events
+
+
+def test_batch_stream_zip_happy_path(client) -> None:
+    """Streaming ZIP: status 200, ndjson content-type, expected event sequence."""
+    import base64 as _b64
+
+    rv = client.post(
+        "/api/qr/batch/stream",
+        data={"start": "1", "count": "3", "format": "zip"},
+    )
+    assert rv.status_code == 200
+    assert rv.content_type.startswith("application/x-ndjson")
+    assert rv.headers.get("Cache-Control") == "no-cache"
+    assert rv.headers.get("X-Accel-Buffering") == "no"
+
+    events = _parse_ndjson(rv.get_data())
+    # one start + three progress + one result = five events
+    assert len(events) == 5
+
+    assert events[0]["event"] == "start"
+    assert events[0]["total"] == 3
+    assert events[0]["format"] == "zip"
+
+    progress = events[1:4]
+    for i, evt in enumerate(progress):
+        assert evt["event"] == "progress"
+        assert evt["index"] == i
+        assert evt["total"] == 3
+        # filename for the un-prefixed default is "<n>.png"
+        assert evt["name"] == f"{i + 1}.png"
+
+    # Indices are monotonically increasing.
+    indices = [evt["index"] for evt in progress]
+    assert indices == sorted(indices)
+    assert indices == [0, 1, 2]
+
+    result = events[4]
+    assert result["event"] == "result"
+    assert result["mimetype"] == "application/zip"
+    assert result["filename"] == "qr_batch_1_3.zip"
+
+    payload = _b64.b64decode(result["data_base64"])
+    assert payload.startswith(b"PK")
+    with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+        assert zf.namelist() == ["1.png", "2.png", "3.png"]
+        for name in zf.namelist():
+            assert zf.read(name).startswith(PNG_MAGIC)
+
+
+def test_batch_stream_pdf_happy_path(client) -> None:
+    """Streaming PDF: terminal result decodes to bytes starting with %PDF-."""
+    import base64 as _b64
+
+    rv = client.post(
+        "/api/qr/batch/stream",
+        data={"start": "1", "count": "2", "format": "pdf"},
+    )
+    assert rv.status_code == 200
+    assert rv.content_type.startswith("application/x-ndjson")
+
+    events = _parse_ndjson(rv.get_data())
+    assert events[0]["event"] == "start"
+    assert events[0]["total"] == 2
+    assert events[0]["format"] == "pdf"
+
+    progress = [e for e in events if e.get("event") == "progress"]
+    assert len(progress) == 2
+    assert [e["index"] for e in progress] == [0, 1]
+
+    result = events[-1]
+    assert result["event"] == "result"
+    assert result["mimetype"] == "application/pdf"
+    assert result["filename"] == "qr_batch_1_2.pdf"
+    payload = _b64.b64decode(result["data_base64"])
+    assert payload.startswith(b"%PDF-")
+
+
+def test_batch_stream_validation_failure_returns_400_json(client) -> None:
+    """Streaming endpoint validation failures must return a normal JSON 400,
+    never partial NDJSON."""
+    rv = client.post(
+        "/api/qr/batch/stream",
+        data={"start": "1", "count": "0"},
+    )
+    assert rv.status_code == 400
+    # JSON content-type, NOT ndjson; we never entered streaming mode.
+    assert rv.mimetype == "application/json"
+    body = rv.get_json()
+    assert body is not None and "error" in body
+    # Body must not contain any NDJSON-style event lines.
+    raw = rv.get_data()
+    assert b'"event"' not in raw
+
+
+def test_batch_stream_unknown_format_returns_400_json(client) -> None:
+    """Streaming endpoint mirrors the synchronous endpoint's format check."""
+    rv = client.post(
+        "/api/qr/batch/stream",
+        data={"start": "1", "count": "2", "format": "xml"},
+    )
+    assert rv.status_code == 400
+    assert rv.mimetype == "application/json"
+    body = rv.get_json()
+    assert body is not None and "error" in body
+
+
+def test_batch_stream_padded_prefix_filenames(client) -> None:
+    """Progress event ``name`` reflects the padded, prefixed filename used
+    in the terminal ZIP - i.e. progress events agree with archive entries."""
+    import base64 as _b64
+
+    rv = client.post(
+        "/api/qr/batch/stream",
+        data={
+            "start": "1",
+            "count": "2",
+            "padding": "3",
+            "prefix": "tkt_",
+            "format": "zip",
+        },
+    )
+    assert rv.status_code == 200
+    events = _parse_ndjson(rv.get_data())
+    progress_names = [e["name"] for e in events if e.get("event") == "progress"]
+    assert progress_names == ["tkt_001.png", "tkt_002.png"]
+
+    result = events[-1]
+    payload = _b64.b64decode(result["data_base64"])
+    with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+        assert zf.namelist() == ["tkt_001.png", "tkt_002.png"]

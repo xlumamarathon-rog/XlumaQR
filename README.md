@@ -130,6 +130,48 @@ curl -fsS -X POST \
 # tickets.zip -> ticket_001.png ... ticket_005.png
 ```
 
+### `POST /api/qr/batch/stream`
+
+A streaming variant of the batch endpoint that powers the live progress
+bar in the browser UI. Form fields, validation rules, and 400 responses
+are identical to `/api/qr/batch`. Once validation passes the response is
+`application/x-ndjson` (HTTP 200) and the body is one JSON object per
+line:
+
+- `{"event": "start", "total": N, "format": "zip"|"pdf",
+   "first": "...", "last": "..."}` once at the top.
+- `{"event": "progress", "index": i, "total": N, "name": "<filename>"}`
+  once per generated QR. `index` runs 0..N-1 monotonically and matches
+  the entry name that will appear in the final archive.
+- `{"event": "result", "filename": "...",
+   "mimetype": "application/zip"|"application/pdf",
+   "data_base64": "..."}` once at the end carrying the packed bytes.
+  The body is base64-encoded so the stream stays JSON-only and trivial
+  to parse line-by-line.
+- `{"event": "error", "error": "..."}` instead of `result` if encoding
+  fails mid-stream (e.g. a substituted template overflows QR capacity).
+  HTTP status remains 200 once streaming has begun; the failure detail
+  is in the event payload.
+
+The response also carries `Cache-Control: no-cache` and
+`X-Accel-Buffering: no` to discourage proxy buffering.
+
+The synchronous `POST /api/qr/batch` remains the simpler choice for
+scripted/curl usage where you just want one ZIP/PDF blob in one
+response. Use `/api/qr/batch/stream` when you want a real percentage
+progress indicator while a large batch is rendering.
+
+```bash
+curl -N -s -X POST \
+  -F start=1 -F count=3 \
+  http://127.0.0.1:5000/api/qr/batch/stream | head
+# {"event": "start", "total": 3, "format": "zip", "first": "1", "last": "3"}
+# {"event": "progress", "index": 0, "total": 3, "name": "1.png"}
+# {"event": "progress", "index": 1, "total": 3, "name": "2.png"}
+# {"event": "progress", "index": 2, "total": 3, "name": "3.png"}
+# {"event": "result", "filename": "qr_batch_1_3.zip", ...}
+```
+
 ### Error handling
 
 Bad input (missing `start`, `count <= 0`, `end < start`, both `count`

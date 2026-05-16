@@ -247,22 +247,30 @@ button.primary:disabled {
 }
 
 .progress-bar-fill {
-  width: 100%;
+  width: 0%;
   height: 100%;
   background: var(--primary);
   border-radius: 4px;
-  animation: progress-pulse 1.5s ease-in-out infinite;
+  transition: width 0.2s ease-out;
 }
 
-@keyframes progress-pulse {
-  0% { opacity: 0.4; transform: translateX(-100%); }
-  50% { opacity: 1; }
-  100% { opacity: 0.4; transform: translateX(100%); }
+.progress-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
 }
 
 .progress-text {
   margin: 0;
   font-size: 0.85rem;
   color: var(--muted);
-  text-align: center;
+}
+
+.progress-percent {
+  font-size: 0.85rem;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  text-align: right;
+  min-width: 3.5em;
 }

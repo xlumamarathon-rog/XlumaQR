@@ -81,6 +81,8 @@
   var batchError = document.getElementById("batch-error");
   var batchProgress = document.getElementById("batch-progress");
   var batchProgressText = batchProgress ? batchProgress.querySelector(".progress-text") : null;
+  var batchProgressFill = batchProgress ? batchProgress.querySelector(".progress-bar-fill") : null;
+  var batchProgressPercent = batchProgress ? batchProgress.querySelector(".progress-percent") : null;
   var countRow = document.getElementById("batch-count-row");
   var endRow = document.getElementById("batch-end-row");
 
@@ -232,15 +234,56 @@
         if (batchProgressText) {
           batchProgressText.textContent = "Generating " + codeCount + " QR code" + (codeCount === 1 ? "" : "s") + "...";
         }
+        if (batchProgressFill) batchProgressFill.style.width = "0%";
+        if (batchProgressPercent) batchProgressPercent.textContent = "0%";
       }
 
       // Disable the submit button during request
       var submitBtn = batchForm.querySelector('button[type="submit"]');
       if (submitBtn) submitBtn.disabled = true;
 
-      fetch("/api/qr/batch", { method: "POST", body: formData })
+      function setPercent(pct) {
+        if (batchProgressFill) batchProgressFill.style.width = pct + "%";
+        if (batchProgressPercent) batchProgressPercent.textContent = pct + "%";
+      }
+
+      function base64ToBytes(b64) {
+        var bin = atob(b64);
+        var len = bin.length;
+        var out = new Uint8Array(len);
+        for (var i = 0; i < len; i++) {
+          out[i] = bin.charCodeAt(i);
+        }
+        return out;
+      }
+
+      function triggerDownload(blob, filename) {
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function () {
+          URL.revokeObjectURL(url);
+        }, 1000);
+      }
+
+      function finish() {
+        if (batchProgress) batchProgress.setAttribute("hidden", "");
+        if (submitBtn) submitBtn.disabled = false;
+      }
+
+      function showError(message) {
+        batchError.textContent = message;
+        batchError.hidden = false;
+      }
+
+      fetch("/api/qr/batch/stream", { method: "POST", body: formData })
         .then(function (response) {
           if (!response.ok) {
+            // Validation failure: server returned a normal JSON 400.
             return response.json().then(
               function (body) {
                 throw new Error(body.error || "Request failed");
@@ -250,36 +293,92 @@
               }
             );
           }
-          var disposition = response.headers.get("Content-Disposition") || "";
-          var match = /filename="?([^"]+)"?/.exec(disposition);
-          var filename = match
-            ? match[1]
-            : "qr_batch." + (fmt === "pdf" ? "pdf" : "zip");
-          return response.blob().then(function (blob) {
-            return { blob: blob, filename: filename };
-          });
-        })
-        .then(function (result) {
-          var url = URL.createObjectURL(result.blob);
-          var a = document.createElement("a");
-          a.href = url;
-          a.download = result.filename;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-          setTimeout(function () {
-            URL.revokeObjectURL(url);
-          }, 1000);
+
+          if (!response.body || !response.body.getReader) {
+            // Older browsers without streaming - fall back to text() then parse.
+            return response.text().then(function (text) {
+              return processStreamText(text);
+            });
+          }
+
+          var reader = response.body.getReader();
+          var decoder = new TextDecoder("utf-8");
+          var leftover = "";
+          var totalSeen = 0;
+
+          function processLine(line) {
+            if (!line) return;
+            var evt;
+            try {
+              evt = JSON.parse(line);
+            } catch (parseErr) {
+              // Ignore malformed lines defensively; the real result event
+              // will surface the failure.
+              return;
+            }
+            if (evt.event === "start") {
+              totalSeen = evt.total || 0;
+              setPercent(0);
+              if (batchProgressText) {
+                batchProgressText.textContent =
+                  "Generating " + totalSeen + " QR code" + (totalSeen === 1 ? "" : "s") + "...";
+              }
+            } else if (evt.event === "progress") {
+              var total = evt.total || totalSeen || 1;
+              var pct = Math.round(((evt.index + 1) / total) * 100);
+              if (pct < 0) pct = 0;
+              if (pct > 100) pct = 100;
+              setPercent(pct);
+            } else if (evt.event === "result") {
+              setPercent(100);
+              var bytes = base64ToBytes(evt.data_base64 || "");
+              var blob = new Blob([bytes], {
+                type: evt.mimetype || "application/octet-stream",
+              });
+              var filename = evt.filename || ("qr_batch." + (fmt === "pdf" ? "pdf" : "zip"));
+              triggerDownload(blob, filename);
+            } else if (evt.event === "error") {
+              throw new Error(evt.error || "Generation failed");
+            }
+          }
+
+          function processStreamText(text) {
+            // Used by the non-streaming fallback path: parse the whole body at once.
+            var lines = text.split("\n");
+            for (var i = 0; i < lines.length; i++) {
+              processLine(lines[i]);
+            }
+          }
+
+          function pump() {
+            return reader.read().then(function (result) {
+              if (result.done) {
+                // Flush any final non-newline-terminated line.
+                if (leftover) {
+                  processLine(leftover);
+                  leftover = "";
+                }
+                return;
+              }
+              var chunk = decoder.decode(result.value, { stream: true });
+              leftover += chunk;
+              var nl = leftover.indexOf("\n");
+              while (nl !== -1) {
+                var line = leftover.slice(0, nl);
+                leftover = leftover.slice(nl + 1);
+                processLine(line);
+                nl = leftover.indexOf("\n");
+              }
+              return pump();
+            });
+          }
+
+          return pump();
         })
         .catch(function (err) {
-          batchError.textContent = err.message;
-          batchError.hidden = false;
+          showError(err.message || String(err));
         })
-        .finally(function () {
-          // Hide progress and re-enable button
-          if (batchProgress) batchProgress.setAttribute("hidden", "");
-          if (submitBtn) submitBtn.disabled = false;
-        });
+        .finally(finish);
     });
   }
 })();

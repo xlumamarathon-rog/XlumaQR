@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import io
 import zipfile
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
 
 import qrcode
 from PIL import Image, ImageDraw, ImageFont
@@ -50,6 +50,7 @@ __all__ = [
     "generate_sequence",
     "images_to_zip",
     "images_to_pdf",
+    "iter_batch_with_progress",
 ]
 
 
@@ -339,3 +340,49 @@ def images_to_pdf(
     c.showPage()
     c.save()
     return buffer.getvalue()
+
+
+def iter_batch_with_progress(
+    items: Iterable[tuple[str, Image.Image]],
+    fmt: str,
+    progress_cb: Callable[[int, str], None] | None = None,
+) -> bytes:
+    """Pack ``items`` into a ZIP or PDF, invoking ``progress_cb`` per item.
+
+    This is a thin streaming wrapper around :func:`images_to_zip` and
+    :func:`images_to_pdf`. ``items`` is consumed lazily (typically the
+    iterator returned by :func:`generate_sequence`); after each
+    ``(filename, image)`` pair has been pulled and rendered into the
+    output container, ``progress_cb(index_zero_based, filename)`` is
+    invoked, where ``index_zero_based`` starts at ``0`` for the first
+    item and increases monotonically.
+
+    Parameters
+    ----------
+    items:
+        Iterable of ``(filename, PIL.Image.Image)`` pairs.
+    fmt:
+        ``"zip"`` or ``"pdf"``. Anything else raises :class:`ValueError`.
+    progress_cb:
+        Optional callable invoked once per item after it has been
+        consumed by the packer. ``None`` disables progress reporting.
+
+    Returns
+    -------
+    bytes
+        The raw bytes of the ZIP archive or PDF document.
+    """
+    if fmt not in {"zip", "pdf"}:
+        raise ValueError("fmt must be 'zip' or 'pdf'")
+
+    def _wrap() -> Iterator[tuple[str, Image.Image]]:
+        for index, pair in enumerate(items):
+            yield pair
+            if progress_cb is not None:
+                # ``pair`` is (filename, image); only the filename is
+                # interesting to a progress consumer.
+                progress_cb(index, pair[0])
+
+    if fmt == "zip":
+        return images_to_zip(_wrap())
+    return images_to_pdf(_wrap())
