@@ -265,33 +265,66 @@ def generate_sequence(
         yield f"{prefix}{n}.png", image
 
 
-def images_to_zip(items: Iterable[tuple[str, Image.Image]]) -> bytes:
-    """Pack ``(filename, image)`` pairs into a ZIP archive in memory.
+def _pack_zip(
+    items: Iterable[tuple[str, Image.Image]],
+) -> Iterator[tuple]:
+    """Pack ``items`` into a ZIP archive in memory, yielding progress.
 
-    Each image is encoded as PNG and stored under its given filename.
-    Returns the raw bytes of the ZIP archive.
+    Internal generator shared by :func:`images_to_zip` (which discards
+    progress events and keeps only the terminal payload) and
+    :func:`iter_batch_with_progress` (which forwards both kinds of
+    events to the HTTP wire). Centralising the loop here keeps the
+    archive-building logic in one place so the synchronous and
+    streaming routes cannot drift.
+
+    Yields
+    ------
+    tuple
+        ``("progress", index_zero_based, filename)`` after each entry
+        is written into the archive, then ``("result", zip_bytes)``
+        exactly once when the source iterator is exhausted.
     """
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for filename, image in items:
+        for index, (filename, image) in enumerate(items):
             png_buf = io.BytesIO()
             image.save(png_buf, format="PNG")
             zf.writestr(filename, png_buf.getvalue())
-    return buffer.getvalue()
+            yield ("progress", index, filename)
+    yield ("result", buffer.getvalue())
 
 
-def images_to_pdf(
+def _pack_pdf(
     items: Iterable[tuple[str, Image.Image]],
     page_size: tuple[float, float] = LETTER,
     cols: int = 3,
     rows: int = 4,
     margin_pt: float = 36.0,
-) -> bytes:
-    """Lay out images in a grid on a PDF and return the raw PDF bytes.
+) -> Iterator[tuple]:
+    """Lay out ``items`` on a PDF grid in memory, yielding progress.
 
-    The PDF uses ``page_size`` (default US Letter) and packs images in a
-    ``cols`` x ``rows`` grid with ``margin_pt`` points of margin on each
-    side. Pages are added automatically when the grid fills.
+    Internal generator shared by :func:`images_to_pdf` and
+    :func:`iter_batch_with_progress`. All PDF layout maths (page size,
+    grid density, margin, cell-fit scaling, page-break trigger) live
+    here so the synchronous and streaming routes cannot diverge if
+    defaults are tuned.
+
+    Memory note
+    -----------
+    Unlike :func:`_pack_zip`, peak memory here grows with the number
+    of items: ``reportlab.pdfgen.canvas.Canvas`` retains drawn-image
+    data inside the canvas's content stream and resource dictionary
+    until ``c.save()`` finalizes the document. The PIL ``Image`` itself
+    is released after each ``drawImage`` call returns, but the PNG
+    bytes that reportlab extracts from it stay alive until the final
+    yield.
+
+    Yields
+    ------
+    tuple
+        ``("progress", index_zero_based, filename)`` after each draw,
+        then ``("result", pdf_bytes)`` exactly once when the source
+        iterator is exhausted.
     """
     if cols <= 0 or rows <= 0:
         raise ValueError("cols and rows must both be > 0")
@@ -305,8 +338,7 @@ def images_to_pdf(
 
     c = pdf_canvas.Canvas(buffer, pagesize=page_size)
     per_page = cols * rows
-    index = 0
-    for _, image in items:
+    for index, (filename, image) in enumerate(items):
         slot = index % per_page
         if index > 0 and slot == 0:
             c.showPage()
@@ -335,11 +367,50 @@ def images_to_pdf(
             preserveAspectRatio=True,
             mask="auto",
         )
-        index += 1
+        yield ("progress", index, filename)
 
     c.showPage()
     c.save()
-    return buffer.getvalue()
+    yield ("result", buffer.getvalue())
+
+
+def images_to_zip(items: Iterable[tuple[str, Image.Image]]) -> bytes:
+    """Pack ``(filename, image)`` pairs into a ZIP archive in memory.
+
+    Each image is encoded as PNG and stored under its given filename.
+    Returns the raw bytes of the ZIP archive.
+    """
+    payload = b""
+    for token in _pack_zip(items):
+        if token[0] == "result":
+            payload = token[1]
+    return payload
+
+
+def images_to_pdf(
+    items: Iterable[tuple[str, Image.Image]],
+    page_size: tuple[float, float] = LETTER,
+    cols: int = 3,
+    rows: int = 4,
+    margin_pt: float = 36.0,
+) -> bytes:
+    """Lay out images in a grid on a PDF and return the raw PDF bytes.
+
+    The PDF uses ``page_size`` (default US Letter) and packs images in a
+    ``cols`` x ``rows`` grid with ``margin_pt`` points of margin on each
+    side. Pages are added automatically when the grid fills.
+    """
+    payload = b""
+    for token in _pack_pdf(
+        items,
+        page_size=page_size,
+        cols=cols,
+        rows=rows,
+        margin_pt=margin_pt,
+    ):
+        if token[0] == "result":
+            payload = token[1]
+    return payload
 
 
 def iter_batch_with_progress(
@@ -350,11 +421,17 @@ def iter_batch_with_progress(
 
     This is the streaming counterpart to :func:`images_to_zip` and
     :func:`images_to_pdf`. ``items`` is consumed lazily (typically the
-    iterator returned by :func:`generate_sequence`) so only one
-    ``(filename, PIL.Image.Image)`` pair is alive at a time. After each
-    pair has been pulled and written into the output container, a
-    progress tuple is yielded; once the source iterator is exhausted, a
-    single result tuple is yielded carrying the packed bytes.
+    iterator returned by :func:`generate_sequence`) so the source
+    iterator only ever has one ``(filename, PIL.Image.Image)`` pair
+    pending at a time. After each pair has been pulled and written into
+    the output container, a progress tuple is yielded; once the source
+    iterator is exhausted, a single result tuple is yielded carrying
+    the packed bytes.
+
+    Internally, both formats delegate to the shared :func:`_pack_zip` /
+    :func:`_pack_pdf` generators so the synchronous (:func:`images_to_zip`,
+    :func:`images_to_pdf`) and streaming routes share one source of
+    truth for archive building and PDF layout.
 
     Yields
     ------
@@ -370,6 +447,22 @@ def iter_batch_with_progress(
     fmt:
         ``"zip"`` or ``"pdf"``. Anything else raises :class:`ValueError`.
 
+    Memory profile
+    --------------
+    The two formats have asymmetric peak-memory behaviour:
+
+    * ``"zip"``: peak live state is one ``PIL.Image`` plus its PNG
+      buffer plus the growing in-memory archive bytes. The source
+      iterator is pulled strictly one item at a time.
+    * ``"pdf"``: the source iterator is also pulled one item at a time,
+      but ``reportlab.pdfgen.canvas.Canvas`` retains drawn-image data
+      inside the canvas's content stream and resource dictionary until
+      ``c.save()`` finalizes the document, so the PNG bytes for every
+      drawn page accumulate in memory until the terminal ``result``
+      event. Peak memory therefore scales with the batch size on the
+      PDF path. Callers sizing very large PDF batches should account
+      for this.
+
     Notes
     -----
     The generator is the natural shape for an HTTP layer that wants to
@@ -380,71 +473,9 @@ def iter_batch_with_progress(
     out of the iterator so the caller can surface it as a clean
     application-level error.
     """
-    if fmt not in {"zip", "pdf"}:
-        raise ValueError("fmt must be 'zip' or 'pdf'")
-
     if fmt == "zip":
-        # Build the ZIP incrementally so each entry is written into the
-        # archive and then released before the next image is rendered.
-        # Peak live state is one ``PIL.Image`` plus its PNG buffer.
-        buffer = io.BytesIO()
-        with zipfile.ZipFile(
-            buffer, mode="w", compression=zipfile.ZIP_DEFLATED
-        ) as zf:
-            for index, (filename, image) in enumerate(items):
-                png_buf = io.BytesIO()
-                image.save(png_buf, format="PNG")
-                zf.writestr(filename, png_buf.getvalue())
-                yield ("progress", index, filename)
-        yield ("result", buffer.getvalue())
-        return
-
-    # PDF: same lazy contract. We mirror the layout maths from
-    # :func:`images_to_pdf` here rather than feeding the canvas through
-    # an iterator wrapper, because the caller wants progress emitted
-    # *between* draws, which would require a coroutine-shaped wrapper
-    # around ``images_to_pdf``. Inlining is shorter and clearer.
-    buffer = io.BytesIO()
-    page_w, page_h = LETTER
-    margin_pt = 36.0
-    cols = 3
-    rows = 4
-    usable_w = page_w - 2 * margin_pt
-    usable_h = page_h - 2 * margin_pt
-    cell_w = usable_w / cols
-    cell_h = usable_h / rows
-
-    c = pdf_canvas.Canvas(buffer, pagesize=LETTER)
-    per_page = cols * rows
-    for index, (filename, image) in enumerate(items):
-        slot = index % per_page
-        if index > 0 and slot == 0:
-            c.showPage()
-
-        col = slot % cols
-        row = slot // cols
-
-        img_w, img_h = image.size
-        scale = min(cell_w / img_w, cell_h / img_h)
-        draw_w = img_w * scale
-        draw_h = img_h * scale
-
-        cell_left = margin_pt + col * cell_w
-        cell_bottom = page_h - margin_pt - (row + 1) * cell_h
-        x = cell_left + (cell_w - draw_w) / 2
-        y = cell_bottom + (cell_h - draw_h) / 2
-
-        c.drawImage(
-            ImageReader(image),
-            x,
-            y,
-            width=draw_w,
-            height=draw_h,
-            preserveAspectRatio=True,
-            mask="auto",
-        )
-        yield ("progress", index, filename)
-
-    c.showPage()
-    c.save()
-    yield ("result", buffer.getvalue())
+        yield from _pack_zip(items)
+    elif fmt == "pdf":
+        yield from _pack_pdf(items)
+    else:
+        raise ValueError("fmt must be 'zip' or 'pdf'")

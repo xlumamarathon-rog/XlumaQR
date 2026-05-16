@@ -165,9 +165,11 @@ The response also carries `Cache-Control: no-cache` and
 > delivery: the final `result` event always lands and the download
 > still triggers, but the live-progress experience is a localhost /
 > properly-streaming-deployment feature, not a guarantee on every
-> hosting target. Vercel-style runtimes that opt into response
-> streaming (Edge runtime / Fluid Compute / response streaming flag)
-> do flush incrementally.
+> hosting target. On Vercel specifically, opting the Python function
+> into Fluid Compute (or any deployment that exposes Python response
+> streaming, e.g. via `vercel.json` `streaming: true`) is what flushes
+> chunks incrementally; the JS-only Edge runtime does not run this
+> Flask app and is not a workaround.
 
 > **Response size limit:** the terminal `result` event embeds the
 > packed ZIP/PDF as base64 inside the JSON line, which inflates the
