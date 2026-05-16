@@ -237,6 +237,16 @@ all accept two optional fields that style the rendered QR codes:
   PIL's `DecompressionBombError` (raised above ~178 MP from inside
   `Image.open` itself) remain hard rejects regardless.
 
+  The 4096 ceiling is chosen deliberately to give users headroom for
+  phone-camera screenshots (modern phones routinely produce
+  ~4032x3024 JPEGs). Three coincident uploads sit at ~192 MB of
+  decoded RGBA on top of the Flask/Pillow runtime, which fits inside
+  the 1 GB Lambda tier we target on Vercel but lands close to the
+  limit on a 256 MB tier. If you are deploying onto a tighter
+  memory tier, lower `LOGO_HARD_MAX_DIMENSION` (e.g. to 2048, which
+  halves the worst-case peak twice to ~16 MB) at the cost of
+  rejecting phone-camera screenshots above 2048 per side.
+
 When a logo is supplied, the encoder is bumped to error-correction
 level H (15-30% recovery, vs M's 15%) so the QR stays scannable with
 the centre region partially obscured. The trade-off is that QR version

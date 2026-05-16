@@ -27,6 +27,14 @@
           panel.setAttribute("hidden", "");
         }
       });
+      // Review v1 issue 4: defer the initial Batch preview render
+      // until the Batch tab is actually activated. The default tab is
+      // Single, so firing the preview unconditionally on page load
+      // would waste one round-trip (and one logo upload, if a logo is
+      // attached) for users who never visit the Batch tab.
+      if (key === "batch") {
+        maybeFireInitialBatchPreview();
+      }
     });
   });
 
@@ -172,6 +180,13 @@
   // changing the logo) re-triggers the existing submit handler. The
   // Batch form mirrors this behaviour with a debounced live preview
   // (scheduleBatchPreview is hoisted from below).
+  //
+  // Review v1 issue 5: the Single live preview is intentionally not
+  // debounced because it only fires on tile clicks and logo file
+  // changes (discrete events), while the Batch live preview is
+  // debounced at 250 ms because it additionally listens to numeric
+  // and template inputs where users can hold an arrow key or paste,
+  // which would otherwise produce a burst of fetches per second.
   var singleDesign = setupDesignSection("single", function () {
     var form = document.getElementById("single-form");
     if (!form) return;
@@ -183,7 +198,35 @@
       form.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
     }
   });
-  var batchDesign = setupDesignSection("batch", scheduleBatchPreview);
+  // Review v1 issue 2: when the design section reports a change
+  // (template tile click, logo file change, logo Clear) we are on the
+  // slow path - the user explicitly interacted with the design, so the
+  // preview should include the attached logo even though it costs an
+  // upload. The fast path (numeric / template-text keystrokes, wired
+  // further down via the batchForm 'input' listener) calls
+  // scheduleBatchPreview() with no argument so the logo is omitted,
+  // which avoids re-uploading up to 2 MB on every debounced keystroke.
+  var batchDesign = setupDesignSection("batch", function () {
+    scheduleBatchPreview({ includeLogo: true });
+  });
+
+  // Review v1 issue 3 + 4: track the templates fetch state and only
+  // fire the initial Batch preview once the user has activated the
+  // Batch tab AND the templates fetch has settled (success OR
+  // failure). The HTML hardcodes ``template_id="default"`` so even
+  // a templates outage still produces a valid preview.
+  var batchTemplatesSettled = false;
+  var batchInitialPreviewFired = false;
+
+  function maybeFireInitialBatchPreview() {
+    if (batchInitialPreviewFired) return;
+    if (!batchTemplatesSettled) return;
+    if (!document.getElementById("batch-form")) return;
+    var batchPanel = panels.batch;
+    if (!batchPanel || !batchPanel.classList.contains("active")) return;
+    batchInitialPreviewFired = true;
+    scheduleBatchPreview({ includeLogo: true });
+  }
 
   fetch("/api/qr/templates")
     .then(function (response) {
@@ -194,17 +237,20 @@
       var templates = (body && body.templates) || [];
       if (singleDesign) singleDesign.load(templates);
       if (batchDesign) batchDesign.load(templates);
-      // Trigger the initial Batch preview render now that the default
-      // template_id is settled. Guard on the form being present so this
-      // is a no-op on pages without the Batch panel.
-      if (document.getElementById("batch-form")) {
-        scheduleBatchPreview();
-      }
     })
     .catch(function () {
       // Templates unavailable (offline / server error). The Design
       // section remains empty but the form still submits with the
       // default template, so the page keeps working.
+    })
+    .finally(function () {
+      // Review v1 issue 3: mark templates settled and try to fire the
+      // initial Batch preview. We use ``finally`` rather than only
+      // ``then`` so a templates outage still fires the initial render
+      // (the HTML hardcodes ``template_id="default"``, which produces
+      // a valid QR even without the registry data).
+      batchTemplatesSettled = true;
+      maybeFireInitialBatchPreview();
     });
 
   // ---- Single QR ---------------------------------------------------
@@ -273,15 +319,44 @@
   // label templates with the zero-padded first number of the configured
   // range (matching what generate_sequence does on the server).
   //
-  // The single-QR preview is intentionally not debounced because it's
-  // wired only to template clicks and logo changes. The batch preview
-  // additionally listens to numeric inputs where a user can hold an
-  // arrow key or paste, so we add a 250 ms debounce.
+  // Review v1 issue 5: the Single QR preview is intentionally not
+  // debounced because it only fires on discrete events (template tile
+  // clicks and logo file changes). The Batch preview additionally
+  // listens to numeric and template-text inputs where users can hold
+  // an arrow key or paste, so a 250 ms debounce keeps fast typing in
+  // start/count/padding/data_template from firing dozens of requests.
+  // The asymmetry is deliberate; harmonising both at 250 ms would
+  // delay the Single preview's response to a single tile click for
+  // no real benefit.
+  //
+  // Review v1 issue 2: when the user is on the keystroke fast path
+  // (numeric / text inputs into the Batch form) we skip the logo on
+  // the request. The Batch preview's headline value is showing what
+  // each generated QR will look like for the substituted data and
+  // template; including the (potentially 2 MB) logo on every
+  // debounced keystroke is meaningful per-keystroke server cost. The
+  // logo is included on the slow path: template tile click, logo file
+  // change, and logo Clear button (the events that are explicitly
+  // about the logo or the design). That means a user who types into a
+  // text field with a logo attached will see the preview without the
+  // logo until they next interact with the design section, which is a
+  // reasonable trade-off for not paying a 2 MB upload per arrow-key
+  // tick.
   var batchPreviewAbort = null;
   var batchPreviewBlobUrl = null;
   var batchPreviewTimer = null;
+  var batchPreviewIncludeLogo = false;
 
-  function scheduleBatchPreview() {
+  function scheduleBatchPreview(opts) {
+    // ``opts.includeLogo`` is sticky across the debounce window: if
+    // any caller in the window passes ``includeLogo: true`` (e.g. a
+    // template tile click) the actual fetch will include the logo,
+    // even if a later keystroke fires scheduleBatchPreview() with no
+    // opts. Without this, a tile click followed quickly by a
+    // keystroke would lose the logo on the resulting fetch.
+    if (opts && opts.includeLogo) {
+      batchPreviewIncludeLogo = true;
+    }
     clearTimeout(batchPreviewTimer);
     batchPreviewTimer = setTimeout(refreshBatchPreview, 250);
   }
@@ -298,6 +373,11 @@
   function refreshBatchPreview() {
     clearTimeout(batchPreviewTimer);
     batchPreviewTimer = null;
+    // Snapshot then reset the sticky flag so the next debounce window
+    // starts fresh (the next caller decides whether to include the
+    // logo, just like the first caller of this window did).
+    var includeLogo = batchPreviewIncludeLogo;
+    batchPreviewIncludeLogo = false;
     if (!batchForm || !batchPreview) return;
 
     var startVal = parseInt(batchForm.elements["start"].value || "", 10);
@@ -344,9 +424,16 @@
     }
     // FormData.set on a file input only copies the empty .value string,
     // so reach for .files[0] like the existing Batch submit handler.
-    var batchLogoInput = document.getElementById("batch-logo");
-    if (batchLogoInput && batchLogoInput.files && batchLogoInput.files.length > 0) {
-      formData.set("logo", batchLogoInput.files[0]);
+    // Review v1 issue 2: the logo is only attached when ``includeLogo``
+    // is set (slow path: template tile click, logo file change, logo
+    // Clear). On the fast path (numeric/text-input keystrokes) the
+    // logo is omitted to avoid re-uploading up to 2 MB per debounced
+    // keystroke.
+    if (includeLogo) {
+      var batchLogoInput = document.getElementById("batch-logo");
+      if (batchLogoInput && batchLogoInput.files && batchLogoInput.files.length > 0) {
+        formData.set("logo", batchLogoInput.files[0]);
+      }
     }
 
     if (batchPreviewAbort) {

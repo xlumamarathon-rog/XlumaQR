@@ -118,6 +118,17 @@ __all__ = [
 # the QR width, so a few hundred pixels at most for a typical render)
 # and resizing once up-front avoids a fresh LANCZOS resize per item
 # when the same logo is reused across a batch.
+#
+# The 4096 ceiling is chosen deliberately to give users headroom for
+# phone-camera screenshots (modern phones routinely produce 4032x3024
+# JPEGs). Each accepted upload allocates a worst-case ~64 MB RGBA
+# bitmap during validation, and three coincident uploads sit at
+# ~192 MB on top of the Flask/Pillow runtime, which fits comfortably
+# inside the 1 GB tier we target on Vercel but lands close to the
+# limit on a 256 MB Lambda. Lower this constant (to 2048, ~16 MB
+# worst case, halving the peak twice) only if you are deploying on a
+# tighter memory tier *and* you are willing to reject phone-camera
+# screenshots above 2048 per side.
 MAX_RANGE_SIZE = 5000
 MAX_DATA_LENGTH = 2300
 MAX_BOX_SIZE = 50

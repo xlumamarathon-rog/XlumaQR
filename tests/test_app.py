@@ -977,6 +977,139 @@ def test_load_logo_auto_resizes_oversized_logo() -> None:
     )
 
 
+def test_load_logo_auto_resize_preserves_aspect_ratio() -> None:
+    """Review v1 issue 6: a non-square upload must preserve aspect ratio
+    on the way through the auto-resize step.
+
+    Build a 2000x500 PNG (4:1 aspect) and assert that both axes shrink
+    and the aspect ratio is preserved within one pixel. ``Image.thumbnail``
+    is documented to preserve aspect ratio, but no test would catch a
+    regression that swapped it for ``Image.resize((MAX, MAX))`` (which
+    would crush the 4:1 input to a 1:1 square).
+    """
+    import app as app_module
+    from PIL import Image as _Image
+    from qr_generator import MAX_LOGO_DIMENSION as _SOFT_MAX
+
+    src = _Image.new("RGB", (2000, 500), (255, 165, 0))
+    buf = io.BytesIO()
+    src.save(buf, format="PNG")
+    raw = buf.getvalue()
+
+    with app_module.app.test_request_context(
+        "/api/qr/single",
+        method="POST",
+        data={
+            "data": "hello",
+            "logo": (io.BytesIO(raw), "logo.png", "image/png"),
+        },
+        content_type="multipart/form-data",
+    ):
+        image = app_module._load_logo_from_request()
+
+    assert image is not None
+    width, height = image.size
+    # Both axes shrank from the source.
+    assert width < 2000 and height < 500, (
+        f"resize did not shrink both axes; got {image.size}"
+    )
+    # The wider axis fits the soft target.
+    assert max(width, height) <= _SOFT_MAX, (
+        f"image size {image.size} exceeds MAX_LOGO_DIMENSION={_SOFT_MAX}"
+    )
+    # Aspect ratio is preserved within one pixel of rounding error
+    # (the source is 4.0 wide:tall; thumbnail rounds the smaller side
+    # to the nearest integer, which can drift the ratio by up to
+    # 1/height_in_target_units).
+    src_ratio = 2000 / 500
+    out_ratio = width / height
+    assert abs(out_ratio - src_ratio) < 0.05, (
+        f"aspect ratio drifted: source {src_ratio:.3f}, output "
+        f"{out_ratio:.3f} (size={image.size})"
+    )
+
+
+def test_single_logo_oversized_jpeg_succeeds(client) -> None:
+    """Review v1 issue 6: a JPEG above the soft auto-resize target is
+    accepted and embedded.
+
+    Only PNG was previously exercised in the auto-resize success path.
+    The format check runs *before* ``Image.thumbnail`` because thumbnail
+    clears ``image.format``, and that ordering matters specifically for
+    JPEG (where ``image.format`` reads ``"JPEG"``). A regression that
+    moved the thumbnail call before the format check would still pass
+    PNG tests (PNGs without auto-resize hit the format check on a
+    fresh ``Image.open``) but would fail this test.
+    """
+    from PIL import Image as _Image
+
+    src = _Image.new("RGB", (2000, 2000), (255, 165, 0))
+    buf = io.BytesIO()
+    src.save(buf, format="JPEG", quality=85)
+    raw = buf.getvalue()
+
+    rv = client.post(
+        "/api/qr/single",
+        data={
+            "data": "hello",
+            "logo": (io.BytesIO(raw), "logo.jpg", "image/jpeg"),
+        },
+        content_type="multipart/form-data",
+    )
+    assert rv.status_code == 200, rv.data
+    assert rv.mimetype == "image/png"
+    assert rv.data.startswith(PNG_MAGIC)
+    pixel = _centre_pixel(rv.data)
+    assert _is_orangeish(pixel), (
+        f"centre pixel {pixel!r} is not orange-ish; "
+        "the auto-resized JPEG logo did not reach the QR centre"
+    )
+
+
+def test_load_logo_at_soft_max_takes_no_resize_path() -> None:
+    """Review v1 issue 6: an upload at *exactly* MAX_LOGO_DIMENSION on
+    both axes takes the no-resize fast path and emerges unchanged.
+
+    The boundary check in the validator is ``> MAX_LOGO_DIMENSION``
+    (strict), so 1024x1024 must pass through with ``image.size ==
+    (1024, 1024)``. A regression to ``>=`` would shrink the image
+    to ``(1024, 1024)`` again via thumbnail (a no-op visually but a
+    waste of cycles, and more importantly evidence that the
+    boundary check was tightened by accident).
+    """
+    import app as app_module
+    from PIL import Image as _Image
+    from qr_generator import MAX_LOGO_DIMENSION as _SOFT_MAX
+
+    src = _Image.new("RGB", (_SOFT_MAX, _SOFT_MAX), (255, 165, 0))
+    buf = io.BytesIO()
+    src.save(buf, format="PNG")
+    raw = buf.getvalue()
+
+    with app_module.app.test_request_context(
+        "/api/qr/single",
+        method="POST",
+        data={
+            "data": "hello",
+            "logo": (io.BytesIO(raw), "logo.png", "image/png"),
+        },
+        content_type="multipart/form-data",
+    ):
+        image = app_module._load_logo_from_request()
+
+    assert image is not None
+    assert image.size == (_SOFT_MAX, _SOFT_MAX), (
+        f"image size {image.size} != ({_SOFT_MAX}, {_SOFT_MAX}); the "
+        "boundary check fired when it should not have"
+    )
+    # ``Image.thumbnail`` clears ``image.format``; if format is still
+    # set (PNG) we know thumbnail did not run.
+    assert (image.format or "").upper() == "PNG", (
+        f"image.format={image.format!r}; auto-resize ran when it "
+        "should have skipped"
+    )
+
+
 def test_single_logo_plus_oversized_payload_returns_400(client) -> None:
     """An H-mode capacity overflow with a logo must surface as a 400."""
     rv = client.post(
