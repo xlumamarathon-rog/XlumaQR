@@ -61,6 +61,23 @@
     "swimming",
   ];
 
+  // Box size used for the HD re-render triggered by the
+  // "Download HD PNG" button under each live preview. The on-screen
+  // preview keeps using whatever ``box_size`` the user typed (default
+  // 10, fast to render); the download path forces this constant so
+  // the saved file is high-resolution regardless.
+  //
+  // (a) At HD_BOX_SIZE = 40 a 33-module QR is 33 * 40 + 2 * 4 * 40 =
+  //     1640 px per side at the default border = 4, well past the
+  //     "looks crisp on a phone screen / printed at 300 DPI"
+  //     threshold.
+  // (b) We deliberately stop short of MAX_BOX_SIZE = 50 because beyond
+  //     ~40 the marginal visual gain is invisible while the response
+  //     payload roughly doubles. The existing MAX_BOX_SIZE remains the
+  //     upper bound users can request manually via the box_size form
+  //     field; this constant only governs the one-click HD download.
+  var HD_BOX_SIZE = 40;
+
   function categoryRank(cat) {
     if (cat === "default") return 0;
     var i = SPORT_ORDER.indexOf(cat);
@@ -274,17 +291,139 @@
     }, 1000);
   }
 
-  // Append a "Download PNG" button to a preview pane. Both render
+  // Append a "Download HD PNG" button to a preview pane. Both render
   // paths replace ``previewEl.innerHTML`` whenever they redraw or
   // reset to the empty state, so the button is naturally cleared
   // alongside the image when no QR is showing.
-  function appendPreviewDownloadButton(previewEl, blob, filename) {
+  //
+  // ``hdRefetchOpts`` (optional) wires the HD re-render behaviour:
+  // on click the button POSTs a fresh request to /api/qr/single with
+  // ``box_size`` forced to HD_BOX_SIZE and downloads the resulting
+  // higher-resolution PNG instead of the cached preview Blob. Two
+  // shapes are accepted:
+  //
+  //   { form, fields, fileFields }
+  //     Used by the Single QR submit handler. The button copies the
+  //     listed text fields from ``form.elements`` and the listed file
+  //     inputs (by name, reading ``.files[0]``) into a fresh FormData,
+  //     overrides ``box_size`` with HD_BOX_SIZE, and POSTs.
+  //
+  //   { formData }
+  //     Used by the Batch live preview, where the on-screen QR is
+  //     rendered with substituted ``data`` / ``label`` values (the
+  //     padded first range item, with ``{n}`` resolved). The HD
+  //     download must encode the SAME substituted payload, not the
+  //     raw ``{n}`` template, so the caller pre-builds a FormData
+  //     that mirrors the preview request and passes it here. The
+  //     button overrides ``box_size`` with HD_BOX_SIZE on click.
+  //
+  // If ``hdRefetchOpts`` is omitted the button reverts to today's
+  // behaviour: just download the cached preview Blob.
+  //
+  // If the HD fetch fails (network, encoder error, abort from a
+  // re-click), the button falls back to downloading the cached
+  // preview Blob so the user still gets a file.
+  function appendPreviewDownloadButton(previewEl, blob, filename, hdRefetchOpts) {
     var btn = document.createElement("button");
     btn.type = "button";
     btn.className = "primary preview-download";
-    btn.textContent = "Download PNG";
+    btn.textContent = "Download HD PNG";
+    btn.title =
+      "Re-renders at high resolution (~1480 px per side at default border) before downloading.";
+
+    // Per-button AbortController so a second click (or a redraw that
+    // leaves the previous button orphaned) can cancel the in-flight
+    // HD fetch instead of letting an outdated download arrive after
+    // the user has moved on.
+    var inflight = null;
+
     btn.addEventListener("click", function () {
-      triggerDownload(blob, filename);
+      if (!hdRefetchOpts) {
+        triggerDownload(blob, filename);
+        return;
+      }
+
+      var hdFormData;
+      if (hdRefetchOpts.formData) {
+        // Batch live-preview path: caller pre-built the FormData with
+        // substituted data/label.
+        hdFormData = hdRefetchOpts.formData;
+      } else if (hdRefetchOpts.form) {
+        // Single QR submit path: copy named fields from the live form
+        // so any edits the user made after the preview rendered are
+        // reflected in the HD download.
+        hdFormData = new FormData();
+        var fields = hdRefetchOpts.fields || [];
+        for (var i = 0; i < fields.length; i++) {
+          var name = fields[i];
+          var el = hdRefetchOpts.form.elements[name];
+          if (el && el.value !== undefined && el.value !== null && el.value !== "") {
+            hdFormData.set(name, el.value);
+          }
+        }
+        var fileFields = hdRefetchOpts.fileFields || [];
+        for (var j = 0; j < fileFields.length; j++) {
+          var fname = fileFields[j];
+          var fileEl = hdRefetchOpts.form.elements[fname];
+          if (fileEl && fileEl.files && fileEl.files.length > 0) {
+            hdFormData.set(fname, fileEl.files[0]);
+          }
+        }
+      } else {
+        triggerDownload(blob, filename);
+        return;
+      }
+      hdFormData.set("box_size", String(HD_BOX_SIZE));
+
+      // Cancel any earlier HD fetch from this same button before
+      // starting a new one.
+      if (inflight) {
+        inflight.abort();
+        inflight = null;
+      }
+      var controller = new AbortController();
+      inflight = controller;
+
+      var originalText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Generating HD...";
+
+      fetch("/api/qr/single", {
+        method: "POST",
+        body: hdFormData,
+        signal: controller.signal,
+      })
+        .then(function (response) {
+          if (!response.ok) {
+            throw new Error("HD render failed (" + response.status + ")");
+          }
+          return response.blob();
+        })
+        .then(function (hdBlob) {
+          triggerDownload(hdBlob, filename);
+        })
+        .catch(function (err) {
+          // AbortError fires when a second click or a redraw cancels
+          // this fetch; in that case we should NOT trigger a fallback
+          // download because the user explicitly moved on.
+          if (err && err.name === "AbortError") {
+            return;
+          }
+          // Any other failure (network, encoder error) falls back to
+          // the cached preview Blob so the user still gets a file.
+          triggerDownload(blob, filename);
+        })
+        .then(function () {
+          // ``finally`` equivalent that also runs on AbortError. Only
+          // restore the button if THIS fetch is still the latest one;
+          // otherwise a newer click already updated the state and we
+          // must not stomp on it.
+          if (inflight === controller) {
+            inflight = null;
+            btn.disabled = false;
+            btn.textContent = originalText;
+          }
+        });
     });
     previewEl.appendChild(btn);
   }
@@ -330,7 +469,16 @@
           // characters that are unsafe for filenames (slashes, NUL,
           // path traversal, etc.), so we use a fixed sensible default
           // rather than trying to sanitise it here.
-          appendPreviewDownloadButton(singlePreview, blob, "qr.png");
+          //
+          // Pass HD-refetch opts so the button re-issues a fresh
+          // POST at HD_BOX_SIZE = 40 before downloading. The fields
+          // list deliberately omits ``box_size`` because the HD
+          // download forces it to HD_BOX_SIZE.
+          appendPreviewDownloadButton(singlePreview, blob, "qr.png", {
+            form: singleForm,
+            fields: ["data", "label", "border", "template_id"],
+            fileFields: ["logo"],
+          });
         })
         .catch(function (err) {
           singleError.textContent = err.message;
@@ -512,13 +660,45 @@
         img.alt = "Batch sample QR preview";
         img.src = batchPreviewBlobUrl;
         batchPreview.appendChild(img);
+        // Build a fresh FormData for the HD download path that
+        // mirrors the preview request's substituted values. We
+        // cannot reuse ``form + fields`` like the Single path does
+        // because ``data`` and ``label`` on the form carry the raw
+        // {n} TEMPLATES; sending those untouched would encode a
+        // different payload than the preview shows. The HD download
+        // must encode the SAME substituted dataValue/labelValue the
+        // preview just rendered.
+        //
+        // The logo is included only when the preview itself ran with
+        // a logo (``includeLogo`` is the same flag that gated the
+        // preview fetch). On the keystroke fast path the preview was
+        // rendered without the logo, so the HD download mirrors that
+        // and stays consistent with what the user sees.
+        var hdFormData = new FormData();
+        hdFormData.set("data", dataValue);
+        if (labelValue) {
+          hdFormData.set("label", labelValue);
+        }
+        if (borderEl && borderEl.value) {
+          hdFormData.set("border", borderEl.value);
+        }
+        if (templateIdEl && templateIdEl.value) {
+          hdFormData.set("template_id", templateIdEl.value);
+        }
+        if (includeLogo) {
+          var hdLogoInput = document.getElementById("batch-logo");
+          if (hdLogoInput && hdLogoInput.files && hdLogoInput.files.length > 0) {
+            hdFormData.set("logo", hdLogoInput.files[0]);
+          }
+        }
         // ``paddedFirst`` is the zero-padded first range value (e.g.
         // "0101"), matching what generate_sequence would emit on the
         // server. It only contains digits, so it is filename-safe.
         appendPreviewDownloadButton(
           batchPreview,
           blob,
-          "qr_" + paddedFirst + ".png"
+          "qr_" + paddedFirst + ".png",
+          { formData: hdFormData }
         );
       })
       .catch(function (err) {

@@ -35,6 +35,13 @@ Form fields:
 - `box_size` (default 10): pixel size of each QR module.
 - `border` (default 4): quiet-zone width in modules.
 
+The on-screen preview is rendered at the `box_size` you typed (default
+10, fast). The **Download HD PNG** button re-renders at `box_size = 40`
+before downloading so the saved file is high-resolution (~1480 px per
+side at the default border for a typical URL payload), regardless of
+the preview's `box_size`. To download at any other `box_size`, set the
+form field directly: the preview will then match the download.
+
 ## Sequential Batch
 
 The Sequential Batch tab generates a numeric range of QR codes and lets

@@ -166,6 +166,76 @@ def test_single_negative_box_size_returns_400(client) -> None:
     assert body is not None and "error" in body
 
 
+def test_single_box_size_40_renders_hd_png(client) -> None:
+    """The Download HD PNG button (FEAT-002) re-fetches at
+    ``box_size=40``. This locks the HTTP-level contract that path
+    depends on: a POST to ``/api/qr/single`` with ``box_size=40`` must
+    return a valid PNG that is strictly larger than the same payload
+    rendered at the default ``box_size=10``. The strict-inequality
+    check is more reliable than asserting a tight pixel-count lower
+    bound because the QR module count varies with payload length and
+    encoder version: "hello" picks a smaller version than a typical
+    URL, so a hardcoded ``>= 1320`` lower bound would over-fit. The
+    strictly-larger check works for ANY payload that fits, which is
+    the property the HD download cares about.
+    """
+    from PIL import Image as _Image  # local import keeps test scope tidy
+
+    rv_default = client.post("/api/qr/single", data={"data": "hello"})
+    rv_hd = client.post("/api/qr/single", data={"data": "hello", "box_size": "40"})
+
+    assert rv_default.status_code == 200
+    assert rv_hd.status_code == 200
+    assert rv_default.mimetype == "image/png"
+    assert rv_hd.mimetype == "image/png"
+    assert rv_default.data.startswith(PNG_MAGIC)
+    assert rv_hd.data.startswith(PNG_MAGIC)
+
+    img_default = _Image.open(io.BytesIO(rv_default.data))
+    img_hd = _Image.open(io.BytesIO(rv_hd.data))
+    # box_size=40 vs box_size=10 must produce a strictly larger image
+    # for the same payload. If box_size were silently ignored, the two
+    # byte streams (and dimensions) would be identical.
+    assert img_hd.size[0] > img_default.size[0]
+    assert img_hd.size[1] > img_default.size[1]
+    # And the HD render must be roughly 4x the default's box_size to
+    # confirm the value really applied (allow some slack because the
+    # legacy fast path's white margin is computed from box_size and
+    # border together, not box_size alone).
+    assert img_hd.size[0] >= 3 * img_default.size[0]
+
+
+def test_single_box_size_50_max_still_accepted(client) -> None:
+    """``MAX_BOX_SIZE = 50`` is the documented upper bound users can
+    request manually via the form field. FEAT-002 caps the one-click
+    HD download at ``HD_BOX_SIZE = 40``, but it must NOT move the
+    public maximum: a POST at ``box_size=50`` is still a valid 200,
+    and ``box_size=51`` is still a 400. This pins both ends of the
+    boundary so a future refactor that conflates the HD constant with
+    the user-facing cap fails the test instead of silently shrinking
+    the public range.
+    """
+    from PIL import Image as _Image  # local import keeps test scope tidy
+
+    rv_50 = client.post("/api/qr/single", data={"data": "hello", "box_size": "50"})
+    assert rv_50.status_code == 200
+    assert rv_50.mimetype == "image/png"
+    assert rv_50.data.startswith(PNG_MAGIC)
+    img_50 = _Image.open(io.BytesIO(rv_50.data))
+    # box_size=50 must produce a strictly larger image than box_size=40
+    # (the HD download size). If MAX_BOX_SIZE were silently capped at
+    # the HD constant, the two would match.
+    rv_40 = client.post("/api/qr/single", data={"data": "hello", "box_size": "40"})
+    assert rv_40.status_code == 200
+    img_40 = _Image.open(io.BytesIO(rv_40.data))
+    assert img_50.size[0] > img_40.size[0]
+
+    rv_51 = client.post("/api/qr/single", data={"data": "hello", "box_size": "51"})
+    assert rv_51.status_code == 400
+    body = rv_51.get_json()
+    assert body is not None and "error" in body
+
+
 def test_batch_count_above_max_returns_400(client) -> None:
     """Issue 3: unbounded count is rejected before rendering."""
     rv = client.post(
