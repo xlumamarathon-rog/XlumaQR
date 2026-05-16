@@ -743,9 +743,15 @@ def _resolve_color_mask(spec: dict):
 def _label_color_from_spec(spec: dict) -> tuple[int, int, int]:
     """Return the representative foreground RGB for a template ``spec``.
 
-    The label band drawn under the QR uses this colour so the printed
-    text matches the QR's visual identity. Each ``color_mask_kind``
-    maps onto a single representative stop:
+    Both label layouts use this colour so the printed text matches the
+    QR's visual identity:
+
+    * the band drawn under the QR (when a label is supplied alongside
+      a logo), and
+    * the centre badge drawn on the QR (when a label is supplied
+      without a logo).
+
+    Each ``color_mask_kind`` maps onto a single representative stop:
 
     * ``solid`` -> ``front_color``
     * ``radial_gradient`` -> ``center_color``

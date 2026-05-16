@@ -948,3 +948,125 @@ def test_label_in_centre_bumps_error_correction_to_h() -> None:
     # underlying qrcode library.
     with pytest.raises(ValueError):
         generate_qr("A" * 2000, label="42")
+
+
+def test_label_centre_badge_long_label_at_floor_still_legible_and_white_padded() -> None:
+    """Auto-fit hits the 24 px font floor with a label long enough
+    that even at the floor the rendered text is wider than the inner
+    pad, so ``_pad_logo``'s ``thumbnail`` step downscales the scratch
+    image. Pin two things at the floor: (a) the bare QR's size is
+    preserved (the centre-badge dispatch is taken, not the band-below
+    layout), and (b) the white rounded pad is still present behind
+    the glyph so the QR remains scannable. Without this regression
+    the floor / inner-pad ratio could quietly drift and silently
+    degrade legibility for long-label callers."""
+    long_label = "ABCDEFGHIJKLMNOP" * 2  # 32 chars
+    bare = generate_qr("hello")
+    labelled = generate_qr("hello", label=long_label).convert("RGB")
+    assert labelled.size == bare.size
+
+    qr_w, qr_h = labelled.size
+    cx, cy = qr_w // 2, qr_h // 2
+    half = max(8, int(min(qr_w, qr_h) * 0.22) // 2)
+
+    # The pad is mostly white (the glyph occupies a small fraction of
+    # the badge area even when downscaled). Require a generous count
+    # of pure-white pixels inside the centre region so a regression
+    # that lost the white pad would fail loudly.
+    white = 0
+    for y in range(cy - half, cy + half):
+        for x in range(cx - half, cx + half):
+            if labelled.getpixel((x, y)) == (255, 255, 255):
+                white += 1
+    assert white >= 200, (
+        f"expected the white rounded pad to dominate the centre region "
+        f"even at the 24 px font floor; got {white} white pixels in a "
+        f"{(2 * half) * (2 * half)}-pixel sample"
+    )
+
+
+def test_label_centre_badge_uses_gradient_template_centre_stop() -> None:
+    """The centre badge colour follows the template's representative
+    stop for non-solid masks too. ``marathon-fire`` is a
+    ``radial_gradient`` with ``center_color=(255, 87, 34)`` (deep
+    orange), so the badge text on top of the white pad must include
+    many orange-ish pixels and never plain black. This guards the
+    gradient branches of ``_label_color_from_spec`` (which feeds the
+    badge), which the existing ``running-track`` arm of
+    ``test_label_text_uses_template_foreground_colour`` does not
+    exercise (solid mask only)."""
+    bare = generate_qr("hello", template_id="marathon-fire")
+    labelled = generate_qr(
+        "hello", label="42", template_id="marathon-fire",
+    ).convert("RGB")
+    qr_w, qr_h = labelled.size
+    assert labelled.size == bare.size
+
+    half = max(8, int(min(qr_w, qr_h) * 0.22) // 2)
+    cx, cy = qr_w // 2, qr_h // 2
+    orange = 0
+    black = 0
+    for y in range(cy - half, cy + half):
+        for x in range(cx - half, cx + half):
+            r, g, b = labelled.getpixel((x, y))
+            # The center_color is (255, 87, 34); allow anti-aliasing
+            # halos by accepting any pixel where red dominates and
+            # blue stays low.
+            if r > 200 and 50 < g < 150 and b < 80:
+                orange += 1
+            if (r, g, b) == (0, 0, 0):
+                black += 1
+    assert orange >= 20, (
+        f"expected gradient template's center_color (orange) to drive "
+        f"the centre-badge glyph colour; got {orange} orange-ish pixels"
+    )
+    assert black == 0, (
+        f"centre badge must not contain any pure-black pixels for a "
+        f"non-default template; got {black}"
+    )
+
+
+def test_label_centre_badge_at_small_box_size_carries_template_colour() -> None:
+    """At a small ``box_size`` the 256 px badge canvas is downscaled
+    aggressively to fit inside the QR's 22% centre region. Confirm
+    the badge still carries the template's foreground colour and
+    sits on a white pad even at the small render used by
+    :func:`render_template_preview` (``box_size=4, border=2``).
+    This pins the tiny-QR legibility floor for the centre-badge
+    layout."""
+    img = generate_qr(
+        "hello",
+        label="42",
+        box_size=4,
+        border=2,
+        template_id="running-track",
+    ).convert("RGB")
+    qr_w, qr_h = img.size
+    assert qr_w == qr_h
+
+    cx, cy = qr_w // 2, qr_h // 2
+    half = max(4, int(min(qr_w, qr_h) * 0.22) // 2)
+    red = 0
+    white = 0
+    black = 0
+    for y in range(cy - half, cy + half):
+        for x in range(cx - half, cx + half):
+            r, g, b = img.getpixel((x, y))
+            if r > 150 and g < 100 and b < 100:
+                red += 1
+            if (r, g, b) == (255, 255, 255):
+                white += 1
+            if (r, g, b) == (0, 0, 0):
+                black += 1
+    assert red >= 5, (
+        f"expected the template's red foreground to reach the badge "
+        f"glyph at small box_size; got {red} red-ish pixels"
+    )
+    assert white >= 50, (
+        f"expected the white rounded pad to remain visible behind the "
+        f"glyph at small box_size; got {white} white pixels"
+    )
+    assert black == 0, (
+        f"centre badge must not contain any pure-black pixels for a "
+        f"templated render; got {black}"
+    )
