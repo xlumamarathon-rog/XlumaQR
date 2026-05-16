@@ -34,6 +34,15 @@ def test_index_returns_200_with_html(client) -> None:
     assert b"Sequential Batch" in body
 
 
+def test_index_batch_panel_has_preview_div(client) -> None:
+    rv = client.get("/")
+    assert rv.status_code == 200
+    body = rv.data
+    # The Batch tab must expose the live-preview hook the JS depends on.
+    assert b'id="batch-preview"' in body
+    assert b'class="preview"' in body
+
+
 def test_single_returns_png(client) -> None:
     rv = client.post("/api/qr/single", data={"data": "hello"})
     assert rv.status_code == 200

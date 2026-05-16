@@ -170,8 +170,8 @@
 
   // The Single QR form has a live preview, so selecting a template (or
   // changing the logo) re-triggers the existing submit handler. The
-  // Batch form is fire-and-forget: the chosen template id and the logo
-  // file are simply included in the submitted FormData.
+  // Batch form mirrors this behaviour with a debounced live preview
+  // (scheduleBatchPreview is hoisted from below).
   var singleDesign = setupDesignSection("single", function () {
     var form = document.getElementById("single-form");
     if (!form) return;
@@ -183,7 +183,7 @@
       form.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
     }
   });
-  var batchDesign = setupDesignSection("batch", null);
+  var batchDesign = setupDesignSection("batch", scheduleBatchPreview);
 
   fetch("/api/qr/templates")
     .then(function (response) {
@@ -194,6 +194,12 @@
       var templates = (body && body.templates) || [];
       if (singleDesign) singleDesign.load(templates);
       if (batchDesign) batchDesign.load(templates);
+      // Trigger the initial Batch preview render now that the default
+      // template_id is settled. Guard on the form being present so this
+      // is a no-op on pages without the Batch panel.
+      if (document.getElementById("batch-form")) {
+        scheduleBatchPreview();
+      }
     })
     .catch(function () {
       // Templates unavailable (offline / server error). The Design
@@ -250,12 +256,142 @@
   var batchForm = document.getElementById("batch-form");
   var batchHint = document.getElementById("batch-hint");
   var batchError = document.getElementById("batch-error");
+  var batchPreview = document.getElementById("batch-preview");
   var batchProgress = document.getElementById("batch-progress");
   var batchProgressText = batchProgress ? batchProgress.querySelector(".progress-text") : null;
   var batchProgressFill = batchProgress ? batchProgress.querySelector(".progress-bar-fill") : null;
   var batchProgressPercent = batchProgress ? batchProgress.querySelector(".progress-percent") : null;
   var countRow = document.getElementById("batch-count-row");
   var endRow = document.getElementById("batch-end-row");
+
+  // ---- Batch live preview -----------------------------------------
+  //
+  // The Batch tab mirrors the Single tab's live preview: whenever a
+  // field that affects the rendered QR changes (template tile, logo,
+  // start, padding, data/label templates, box size, border) we re-fetch
+  // a sample using /api/qr/single, substituting '{n}' in the data and
+  // label templates with the zero-padded first number of the configured
+  // range (matching what generate_sequence does on the server).
+  //
+  // The single-QR preview is intentionally not debounced because it's
+  // wired only to template clicks and logo changes. The batch preview
+  // additionally listens to numeric inputs where a user can hold an
+  // arrow key or paste, so we add a 250 ms debounce.
+  var batchPreviewAbort = null;
+  var batchPreviewBlobUrl = null;
+  var batchPreviewTimer = null;
+
+  function scheduleBatchPreview() {
+    clearTimeout(batchPreviewTimer);
+    batchPreviewTimer = setTimeout(refreshBatchPreview, 250);
+  }
+
+  function setBatchPreviewMessage(message) {
+    if (!batchPreview) return;
+    batchPreview.innerHTML = "";
+    var p = document.createElement("p");
+    p.className = "preview-empty";
+    p.textContent = message;
+    batchPreview.appendChild(p);
+  }
+
+  function refreshBatchPreview() {
+    clearTimeout(batchPreviewTimer);
+    batchPreviewTimer = null;
+    if (!batchForm || !batchPreview) return;
+
+    var startVal = parseInt(batchForm.elements["start"].value || "", 10);
+    if (isNaN(startVal)) {
+      setBatchPreviewMessage(
+        "A sample QR using the first range value will appear here."
+      );
+      return;
+    }
+    var paddingVal = parseInt(batchForm.elements["padding"].value || "0", 10);
+    if (isNaN(paddingVal) || paddingVal < 0) paddingVal = 0;
+    var paddedFirst = paddingVal > 0 ? pad(startVal, paddingVal) : String(startVal);
+
+    var dataTemplateEl = batchForm.elements["data_template"];
+    var labelTemplateEl = batchForm.elements["label_template"];
+    var dataTemplate = dataTemplateEl ? dataTemplateEl.value : "";
+    var labelTemplate = labelTemplateEl ? labelTemplateEl.value : "";
+    var dataValue = dataTemplate.split("{n}").join(paddedFirst);
+    var labelValue = labelTemplate.split("{n}").join(paddedFirst);
+
+    if (!dataValue) {
+      setBatchPreviewMessage(
+        "A sample QR using the first range value will appear here."
+      );
+      return;
+    }
+
+    var formData = new FormData();
+    formData.set("data", dataValue);
+    if (labelValue) {
+      formData.set("label", labelValue);
+    }
+    var boxSizeEl = batchForm.elements["box_size"];
+    if (boxSizeEl && boxSizeEl.value) {
+      formData.set("box_size", boxSizeEl.value);
+    }
+    var borderEl = batchForm.elements["border"];
+    if (borderEl && borderEl.value) {
+      formData.set("border", borderEl.value);
+    }
+    var templateIdEl = batchForm.elements["template_id"];
+    if (templateIdEl && templateIdEl.value) {
+      formData.set("template_id", templateIdEl.value);
+    }
+    // FormData.set on a file input only copies the empty .value string,
+    // so reach for .files[0] like the existing Batch submit handler.
+    var batchLogoInput = document.getElementById("batch-logo");
+    if (batchLogoInput && batchLogoInput.files && batchLogoInput.files.length > 0) {
+      formData.set("logo", batchLogoInput.files[0]);
+    }
+
+    if (batchPreviewAbort) {
+      batchPreviewAbort.abort();
+      batchPreviewAbort = null;
+    }
+    var controller = new AbortController();
+    batchPreviewAbort = controller;
+
+    fetch("/api/qr/single", {
+      method: "POST",
+      body: formData,
+      signal: controller.signal,
+    })
+      .then(function (response) {
+        if (!response.ok) {
+          return response.json().then(
+            function (body) {
+              throw new Error(body.error || "Preview unavailable");
+            },
+            function () {
+              throw new Error("Preview unavailable");
+            }
+          );
+        }
+        return response.blob();
+      })
+      .then(function (blob) {
+        if (batchPreviewBlobUrl) {
+          URL.revokeObjectURL(batchPreviewBlobUrl);
+        }
+        batchPreviewBlobUrl = URL.createObjectURL(blob);
+        batchPreview.innerHTML = "";
+        var img = document.createElement("img");
+        img.alt = "Batch sample QR preview";
+        img.src = batchPreviewBlobUrl;
+        batchPreview.appendChild(img);
+      })
+      .catch(function (err) {
+        if (err && err.name === "AbortError") {
+          return;
+        }
+        setBatchPreviewMessage(err && err.message ? err.message : "Preview unavailable");
+      });
+  }
 
   // Advanced settings toggle
   var advancedToggle = document.getElementById("batch-advanced-toggle");
@@ -359,11 +495,15 @@
   }
 
   if (batchForm) {
-    batchForm.addEventListener("input", updateHint);
+    batchForm.addEventListener("input", function () {
+      updateHint();
+      scheduleBatchPreview();
+    });
     batchForm.addEventListener("change", function (event) {
       if (event.target && event.target.name === "mode") {
         updateModeVisibility();
       }
+      scheduleBatchPreview();
     });
     updateModeVisibility();
 
