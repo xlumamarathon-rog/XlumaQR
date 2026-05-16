@@ -613,7 +613,7 @@ def test_max_logo_constants_exposed() -> None:
 
     assert MAX_LOGO_BYTES == 2 * 1024 * 1024
     assert MAX_LOGO_DIMENSION == 1024
-    assert LOGO_WORK_SIZE == 256
+    assert LOGO_WORK_SIZE == 1024
 
 
 # --- Custom QR designs: review v1 follow-ups -----------------------

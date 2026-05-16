@@ -114,11 +114,24 @@ __all__ = [
 # (``LOGO_HARD_MAX_DIMENSION ** 2 * 4`` bytes for an RGBA decode, ~64 MB
 # at 4096) is the largest allocation the validator will tolerate before
 # the auto-resize step. ``LOGO_WORK_SIZE`` is the working size we
-# resize a validated logo down to before pasting it onto the QR; the QR
-# centre region we hand to ``StyledPilImage`` is small (about 22% of
-# the QR width, so a few hundred pixels at most for a typical render)
-# and resizing once up-front avoids a fresh LANCZOS resize per item
-# when the same logo is reused across a batch.
+# resize a validated logo down to before pasting it onto the QR; the
+# padded result is then handed to ``StyledPilImage``, which scales it
+# to ``embedded_image_ratio = 0.22`` of the QR's pixel width. The
+# value is set to 1024 (rather than the 256 it used to be) so every
+# render in the box_size range we support is a clean LANCZOS
+# *downscale* rather than an upscale. At the HD download size
+# (``box_size = 40``, ~1640 px wide for a 33-module QR) the 22%
+# centre region is ~360 px, so the previous 256 px source had to be
+# upscaled and produced a visibly blurry logo on saved files; 1024
+# leaves headroom even at the largest box_size. A 1024x1024 RGBA pad
+# is ~4 MB, allocated once per render. This does *not* change peak
+# memory (still dominated by the upload's pre-resize bitmap, bounded
+# by ``LOGO_HARD_MAX_DIMENSION ** 2 * 4`` = ~64 MB at the 4096
+# ceiling) but it does add ~4 MB to the steady-state per-render
+# footprint, which is comfortably inside the 1 GB Lambda tier and
+# still fine on a 256 MB tier. Resizing once up-front also avoids a
+# fresh LANCZOS resize per item when the same logo is reused across
+# a batch.
 #
 # The 4096 ceiling is chosen deliberately to give users headroom for
 # phone-camera screenshots (modern phones routinely produce 4032x3024
@@ -138,7 +151,7 @@ MAX_PADDING = 12
 MAX_LOGO_BYTES = 2 * 1024 * 1024
 MAX_LOGO_DIMENSION = 1024
 LOGO_HARD_MAX_DIMENSION = 4096
-LOGO_WORK_SIZE = 256
+LOGO_WORK_SIZE = 1024
 
 
 # --- Label rendering -----------------------------------------------------

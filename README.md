@@ -247,6 +247,18 @@ all accept two optional fields that style the rendered QR codes:
   halves the worst-case peak twice to ~16 MB) at the cost of
   rejecting phone-camera screenshots above 2048 per side.
 
+  After validation, every accepted logo is pre-resized to
+  `LOGO_WORK_SIZE = 1024` px on its longest side and pasted onto a
+  white rounded-square pad before being handed to the encoder. 1024
+  is chosen so the QR centre region we hand to `StyledPilImage`
+  (about 22% of the QR's pixel width, so ~360 px even at the HD
+  download `box_size = 40` ~1640 px render) is always reached by a
+  clean LANCZOS *downscale*; a smaller working size would force an
+  upscale at HD and reintroduce the blurry-logo artefact the
+  download path was built to avoid. The 1024x1024 RGBA pad is ~4 MB
+  per render and does not change the peak-memory bound (still set
+  by the pre-resize bitmap at `LOGO_HARD_MAX_DIMENSION`).
+
 When a logo is supplied, the encoder is bumped to error-correction
 level H (15-30% recovery, vs M's 15%) so the QR stays scannable with
 the centre region partially obscured. The trade-off is that QR version
