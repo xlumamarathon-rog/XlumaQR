@@ -166,6 +166,17 @@ def _load_logo_from_request() -> Image.Image | None:
     the dimension check runs first, but could conceivably surface from
     a pathological PIL bug) propagates as a real failure rather than
     being masked as a generic 400.
+
+    :class:`PIL.Image.DecompressionBombError` is the *exception* PIL
+    raises (above ~178 MP, twice the warning threshold) from inside
+    :func:`Image.open` itself, *before* our own ``image.size`` check
+    can run. ``DecompressionBombError`` inherits directly from
+    :class:`Exception`, not :class:`OSError`/:class:`SyntaxError`/
+    :class:`ValueError`, so it is caught explicitly here and surfaced
+    as the ``"logo dimensions too large"`` 400. Such an upload is
+    necessarily larger than our own ``MAX_LOGO_DIMENSION`` cap
+    (1024 per side), so the dimension-cap message is the semantically
+    correct response.
     """
     upload = request.files.get("logo")
     if upload is None or not getattr(upload, "filename", ""):
@@ -189,6 +200,17 @@ def _load_logo_from_request() -> Image.Image | None:
             warnings.simplefilter("ignore", Image.DecompressionBombWarning)
             probe = Image.open(io.BytesIO(raw))
             probe.verify()
+    except Image.DecompressionBombError as exc:
+        # Above ~178 MP (2 * MAX_IMAGE_PIXELS), PIL escalates the bomb
+        # warning to an exception inside ``Image.open()`` itself, before
+        # our own ``image.size`` check has a chance to run. Map it to
+        # the dimension-cap error: such an upload is necessarily larger
+        # than our own ``MAX_LOGO_DIMENSION`` cap. Caught explicitly
+        # because ``DecompressionBombError`` extends ``Exception``
+        # directly, not the narrower types below.
+        raise ValueError(
+            f"logo dimensions too large (max {MAX_LOGO_DIMENSION}x{MAX_LOGO_DIMENSION})"
+        ) from exc
     except UnidentifiedImageError as exc:
         raise ValueError("logo could not be decoded") from exc
     except (OSError, SyntaxError, ValueError) as exc:
@@ -207,6 +229,10 @@ def _load_logo_from_request() -> Image.Image | None:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", Image.DecompressionBombWarning)
             image = Image.open(io.BytesIO(raw))
+    except Image.DecompressionBombError as exc:
+        raise ValueError(
+            f"logo dimensions too large (max {MAX_LOGO_DIMENSION}x{MAX_LOGO_DIMENSION})"
+        ) from exc
     except UnidentifiedImageError as exc:
         raise ValueError("logo could not be decoded") from exc
     except (OSError, SyntaxError, ValueError) as exc:

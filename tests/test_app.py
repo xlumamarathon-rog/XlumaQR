@@ -1122,3 +1122,128 @@ def test_get_template_preview_square_gradient_renders(client) -> None:
     assert rv.mimetype == "image/png"
     assert rv.data.startswith(PNG_MAGIC)
 
+
+# --- Custom QR designs: review v2 follow-ups ------------------------
+
+
+def test_single_logo_decompression_bomb_error_band_returns_400(client) -> None:
+    """Review v2 issue 1: PIL escalates the bomb warning to a hard
+    :class:`PIL.Image.DecompressionBombError` *exception* once the
+    declared image area exceeds ``2 * Image.MAX_IMAGE_PIXELS``
+    (~178 956 970 pixels, ~13378 px per side). The error is raised
+    from inside :func:`PIL.Image.open` itself, **before** the
+    validator's own ``image.size`` check runs.
+
+    ``DecompressionBombError`` extends :class:`Exception` directly, not
+    :class:`OSError`/:class:`SyntaxError`/:class:`ValueError`, so the
+    narrowed except chain that closed review v1 issue 4 reopened a
+    one-band-higher version of the same gap closed by review v1
+    issue 1: a 14000x14000 single-colour PNG (~218 KB on the wire,
+    well under the 2 MiB byte cap, ~196 MP > the 2x bomb threshold)
+    used to surface as an HTTP 500 with a ``DecompressionBombError``
+    traceback in the body, instead of a clean 400.
+
+    The fix maps :class:`PIL.Image.DecompressionBombError` to the same
+    ``logo dimensions too large`` 400 the explicit dimension check
+    produces: any upload that trips the bomb threshold is necessarily
+    larger than ``MAX_LOGO_DIMENSION`` per side, so the dimension-cap
+    message is the semantically correct response.
+
+    The existing 12000x12000 bomb test exercises the *warning* band
+    (between ``MAX_IMAGE_PIXELS`` and ``2 * MAX_IMAGE_PIXELS``); this
+    test exercises the *error* band above ``2 * MAX_IMAGE_PIXELS`` and
+    locks down both the status code and the dimension-cap message.
+    """
+    import warnings
+
+    from PIL import Image as _Image
+
+    # 14000^2 = 196 000 000 pixels, comfortably above
+    # ``2 * Image.MAX_IMAGE_PIXELS`` (178 956 970), so PIL raises
+    # ``DecompressionBombError`` from inside ``Image.open``. We build
+    # a single-channel PNG so the on-the-wire bytes stay small (around
+    # 218 KB) and fit comfortably under ``MAX_LOGO_BYTES``.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", _Image.DecompressionBombWarning)
+        bomb = _Image.new("L", (14000, 14000), 255)
+        buf = io.BytesIO()
+        bomb.save(buf, format="PNG", optimize=True)
+    raw = buf.getvalue()
+
+    from qr_generator import MAX_LOGO_BYTES as _MAX
+
+    assert len(raw) < _MAX, (
+        f"bomb is {len(raw)} bytes, expected to fit under {_MAX}"
+    )
+    # And confirm the area really does sit in the error band, so the
+    # test does not silently slide into the warning band if PIL's
+    # default ``MAX_IMAGE_PIXELS`` ever changes.
+    assert 14000 * 14000 > 2 * _Image.MAX_IMAGE_PIXELS
+
+    rv = client.post(
+        "/api/qr/single",
+        data={
+            "data": "hello",
+            "logo": (io.BytesIO(raw), "bomb.png", "image/png"),
+        },
+        content_type="multipart/form-data",
+    )
+    # Must be a clean 400, not a 500 with a DecompressionBombError
+    # traceback in the body.
+    assert rv.status_code == 400, rv.data
+    body = rv.get_json()
+    assert body is not None and "error" in body
+    # The dimension-cap message proves the error was mapped correctly,
+    # not just absorbed by some catch-all that masks it as "could not
+    # be decoded". The substring also locks the user-facing wording so
+    # the synchronous and streaming endpoints stay consistent.
+    assert "dimension" in body["error"].lower(), body["error"]
+
+
+def test_load_logo_maps_decompression_bomb_error_to_dimension_message() -> None:
+    """Unit-level guard for review v2 issue 1: the validator helper
+    must translate :class:`PIL.Image.DecompressionBombError` (which
+    extends :class:`Exception` directly, not the narrowed
+    ``(OSError, SyntaxError, ValueError)`` tuple) to the dimension-cap
+    error message. This test bypasses the route layer and asserts the
+    mapping directly so a future refactor of the helper that drops the
+    explicit ``except Image.DecompressionBombError`` clause cannot pass
+    silently even if the route-level test above is somehow skipped or
+    rewritten.
+    """
+    import warnings
+
+    import pytest
+    from PIL import Image as _Image
+
+    import app as app_module
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", _Image.DecompressionBombWarning)
+        bomb = _Image.new("L", (14000, 14000), 255)
+        buf = io.BytesIO()
+        bomb.save(buf, format="PNG", optimize=True)
+    raw = buf.getvalue()
+
+    # Drive the helper through Flask's test request context so
+    # ``request.files`` resolves to our crafted upload.
+    with app_module.app.test_request_context(
+        "/api/qr/single",
+        method="POST",
+        data={
+            "data": "hello",
+            "logo": (io.BytesIO(raw), "bomb.png", "image/png"),
+        },
+        content_type="multipart/form-data",
+    ):
+        with pytest.raises(ValueError) as excinfo:
+            app_module._load_logo_from_request()
+
+    msg = str(excinfo.value).lower()
+    assert "dimension" in msg, str(excinfo.value)
+    # And the cause chain preserves the original PIL exception so an
+    # operator inspecting logs can still see what really happened.
+    assert isinstance(
+        excinfo.value.__cause__, _Image.DecompressionBombError
+    ), type(excinfo.value.__cause__).__name__
+
