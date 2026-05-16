@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# Test/cache
+.pytest_cache/
+
+# Build output
+dist/
+build/
+
+# OS
+.DS_Store
+
+# Generated artifacts (output/ is created at runtime; do not commit)
+output/
+*.zip
+*.pdf
+!tests/**/*.zip
+!tests/**/*.pdf
