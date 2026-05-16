@@ -29,17 +29,37 @@ Public API
 * :func:`generate_sequence` - iterator of ``(filename, PIL.Image.Image)``.
 * :func:`images_to_zip` - pack an iterable of images into a ZIP archive.
 * :func:`images_to_pdf` - lay out images on a PDF grid (one PDF per call).
+* :func:`list_templates` - return the built-in design templates registry.
+* :func:`get_template` - look up a template by id (raises ``ValueError``).
+* :func:`render_template_preview` - render a small thumbnail PNG for a template.
 """
 
 from __future__ import annotations
 
+import copy
 import io
 import zipfile
 from typing import Iterable, Iterator
 
 import qrcode
 from PIL import Image, ImageDraw, ImageFont
-from qrcode.constants import ERROR_CORRECT_M
+from qrcode.constants import ERROR_CORRECT_H, ERROR_CORRECT_M
+from qrcode.image.styledpil import StyledPilImage
+from qrcode.image.styles.colormasks import (
+    HorizontalGradiantColorMask,
+    RadialGradiantColorMask,
+    SolidFillColorMask,
+    SquareGradiantColorMask,
+    VerticalGradiantColorMask,
+)
+from qrcode.image.styles.moduledrawers.pil import (
+    CircleModuleDrawer,
+    GappedSquareModuleDrawer,
+    HorizontalBarsDrawer,
+    RoundedModuleDrawer,
+    SquareModuleDrawer,
+    VerticalBarsDrawer,
+)
 from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas as pdf_canvas
@@ -51,6 +71,18 @@ __all__ = [
     "images_to_zip",
     "images_to_pdf",
     "iter_batch_with_progress",
+    "list_templates",
+    "get_template",
+    "render_template_preview",
+    "TEMPLATES",
+    "MAX_RANGE_SIZE",
+    "MAX_DATA_LENGTH",
+    "MAX_BOX_SIZE",
+    "MAX_BORDER",
+    "MAX_PADDING",
+    "MAX_LOGO_BYTES",
+    "MAX_LOGO_DIMENSION",
+    "LOGO_WORK_SIZE",
 ]
 
 
@@ -68,11 +100,661 @@ __all__ = [
 # the cap so any input that passes the HTTP validator will encode cleanly
 # regardless of character set; callers that exceed it should see a 400
 # from the HTTP layer rather than a 500 from the encoder.
+#
+# ``MAX_LOGO_BYTES`` / ``MAX_LOGO_DIMENSION`` are advisory limits the HTTP
+# layer enforces on uploaded logo bitmaps so a single multipart request
+# cannot exhaust the Lambda's memory. ``LOGO_WORK_SIZE`` is the working
+# size we resize a validated logo down to before pasting it onto the QR;
+# the QR centre region we hand to ``StyledPilImage`` is small (about 22%
+# of the QR width, so a few hundred pixels at most for a typical render)
+# and resizing once up-front avoids a fresh LANCZOS resize per item when
+# the same logo is reused across a batch.
 MAX_RANGE_SIZE = 5000
 MAX_DATA_LENGTH = 2300
 MAX_BOX_SIZE = 50
 MAX_BORDER = 16
 MAX_PADDING = 12
+MAX_LOGO_BYTES = 2 * 1024 * 1024
+MAX_LOGO_DIMENSION = 1024
+LOGO_WORK_SIZE = 256
+
+
+# --- Templates registry --------------------------------------------------
+#
+# TEMPLATES is the built-in catalogue of QR design presets. Each entry is
+# a plain dict so it can be JSON-serialised straight to the wire by the
+# HTTP layer.
+#
+# Entry shape::
+#
+#     {
+#         "id": <slug>,            # stable identifier (kebab-case)
+#         "name": <human name>,    # what the UI displays
+#         "category": <slug>,      # one of: default, marathon, running,
+#                                  # duathlon, triathlon, cycling, swimming,
+#                                  # business, event, wifi, social, personal
+#         "spec": {
+#             "module_drawer_kind": one of {square, rounded, circle,
+#                                           gapped_square, vertical_bars,
+#                                           horizontal_bars},
+#             "color_mask_kind": one of {solid, radial_gradient,
+#                                        square_gradient,
+#                                        horizontal_gradient,
+#                                        vertical_gradient},
+#             # plus the named colour stops the chosen mask consumes;
+#             # always RGB tuples:
+#             "back_color": (r, g, b),
+#             # solid:
+#             "front_color": (r, g, b),
+#             # radial / square gradient:
+#             "center_color": (r, g, b),
+#             "edge_color":   (r, g, b),
+#             # horizontal gradient:
+#             "left_color":   (r, g, b),
+#             "right_color":  (r, g, b),
+#             # vertical gradient:
+#             "top_color":    (r, g, b),
+#             "bottom_color": (r, g, b),
+#         },
+#     }
+#
+# The reserved ``default`` template (id ``default``, category ``default``)
+# is wired so that callers passing ``template_id='default'`` with no logo
+# fall back to the legacy plain-black-on-white render path byte-for-byte.
+# Sport templates use warm reds/oranges for marathon/running, blue+yellow
+# gradients for triathlon, blue/cyan for swimming, and green/yellow for
+# cycling. General-use categories favour cleaner solids and gentle
+# gradients suitable for day-to-day use.
+TEMPLATES: list[dict] = [
+    # --- default (legacy plain rendering) --------------------------------
+    {
+        "id": "default",
+        "name": "Default (plain black & white)",
+        "category": "default",
+        "spec": {
+            "module_drawer_kind": "square",
+            "color_mask_kind": "solid",
+            "back_color": (255, 255, 255),
+            "front_color": (0, 0, 0),
+        },
+    },
+    # --- marathon (4) ----------------------------------------------------
+    {
+        "id": "marathon-fire",
+        "name": "Marathon - Fire",
+        "category": "marathon",
+        "spec": {
+            "module_drawer_kind": "rounded",
+            "color_mask_kind": "radial_gradient",
+            "back_color": (255, 255, 255),
+            "center_color": (255, 87, 34),
+            "edge_color": (183, 28, 28),
+        },
+    },
+    {
+        "id": "marathon-sunset",
+        "name": "Marathon - Sunset",
+        "category": "marathon",
+        "spec": {
+            "module_drawer_kind": "rounded",
+            "color_mask_kind": "vertical_gradient",
+            "back_color": (255, 255, 255),
+            "top_color": (255, 152, 0),
+            "bottom_color": (191, 54, 12),
+        },
+    },
+    {
+        "id": "marathon-medal",
+        "name": "Marathon - Medal",
+        "category": "marathon",
+        "spec": {
+            "module_drawer_kind": "circle",
+            "color_mask_kind": "horizontal_gradient",
+            "back_color": (255, 255, 255),
+            "left_color": (255, 193, 7),
+            "right_color": (216, 67, 21),
+        },
+    },
+    {
+        "id": "marathon-asphalt",
+        "name": "Marathon - Asphalt",
+        "category": "marathon",
+        "spec": {
+            "module_drawer_kind": "square",
+            "color_mask_kind": "solid",
+            "back_color": (255, 255, 255),
+            "front_color": (33, 33, 33),
+        },
+    },
+    # --- running (4) -----------------------------------------------------
+    {
+        "id": "running-energy",
+        "name": "Running - Energy",
+        "category": "running",
+        "spec": {
+            "module_drawer_kind": "rounded",
+            "color_mask_kind": "horizontal_gradient",
+            "back_color": (255, 255, 255),
+            "left_color": (244, 67, 54),
+            "right_color": (255, 152, 0),
+        },
+    },
+    {
+        "id": "running-track",
+        "name": "Running - Track",
+        "category": "running",
+        "spec": {
+            "module_drawer_kind": "horizontal_bars",
+            "color_mask_kind": "solid",
+            "back_color": (255, 255, 255),
+            "front_color": (211, 47, 47),
+        },
+    },
+    {
+        "id": "running-trail",
+        "name": "Running - Trail",
+        "category": "running",
+        "spec": {
+            "module_drawer_kind": "rounded",
+            "color_mask_kind": "vertical_gradient",
+            "back_color": (255, 255, 255),
+            "top_color": (191, 54, 12),
+            "bottom_color": (62, 39, 35),
+        },
+    },
+    {
+        "id": "running-dawn",
+        "name": "Running - Dawn",
+        "category": "running",
+        "spec": {
+            "module_drawer_kind": "circle",
+            "color_mask_kind": "radial_gradient",
+            "back_color": (255, 255, 255),
+            "center_color": (255, 138, 101),
+            "edge_color": (198, 40, 40),
+        },
+    },
+    # --- duathlon (3) ----------------------------------------------------
+    {
+        "id": "duathlon-twin",
+        "name": "Duathlon - Twin",
+        "category": "duathlon",
+        "spec": {
+            "module_drawer_kind": "rounded",
+            "color_mask_kind": "horizontal_gradient",
+            "back_color": (255, 255, 255),
+            "left_color": (211, 47, 47),
+            "right_color": (46, 125, 50),
+        },
+    },
+    {
+        "id": "duathlon-relay",
+        "name": "Duathlon - Relay",
+        "category": "duathlon",
+        "spec": {
+            "module_drawer_kind": "gapped_square",
+            "color_mask_kind": "vertical_gradient",
+            "back_color": (255, 255, 255),
+            "top_color": (245, 127, 23),
+            "bottom_color": (27, 94, 32),
+        },
+    },
+    {
+        "id": "duathlon-stride",
+        "name": "Duathlon - Stride",
+        "category": "duathlon",
+        "spec": {
+            "module_drawer_kind": "square",
+            "color_mask_kind": "solid",
+            "back_color": (255, 255, 255),
+            "front_color": (78, 52, 46),
+        },
+    },
+    # --- triathlon (3) ---------------------------------------------------
+    {
+        "id": "triathlon-tri",
+        "name": "Triathlon - Tri",
+        "category": "triathlon",
+        "spec": {
+            "module_drawer_kind": "rounded",
+            "color_mask_kind": "horizontal_gradient",
+            "back_color": (255, 255, 255),
+            "left_color": (13, 71, 161),
+            "right_color": (255, 193, 7),
+        },
+    },
+    {
+        "id": "triathlon-ironwave",
+        "name": "Triathlon - Ironwave",
+        "category": "triathlon",
+        "spec": {
+            "module_drawer_kind": "circle",
+            "color_mask_kind": "radial_gradient",
+            "back_color": (255, 255, 255),
+            "center_color": (255, 235, 59),
+            "edge_color": (21, 101, 192),
+        },
+    },
+    {
+        "id": "triathlon-sprint",
+        "name": "Triathlon - Sprint",
+        "category": "triathlon",
+        "spec": {
+            "module_drawer_kind": "rounded",
+            "color_mask_kind": "vertical_gradient",
+            "back_color": (255, 255, 255),
+            "top_color": (25, 118, 210),
+            "bottom_color": (255, 167, 38),
+        },
+    },
+    # --- cycling (4) -----------------------------------------------------
+    {
+        "id": "cycling-peloton",
+        "name": "Cycling - Peloton",
+        "category": "cycling",
+        "spec": {
+            "module_drawer_kind": "circle",
+            "color_mask_kind": "horizontal_gradient",
+            "back_color": (255, 255, 255),
+            "left_color": (104, 159, 56),
+            "right_color": (255, 235, 59),
+        },
+    },
+    {
+        "id": "cycling-mountain",
+        "name": "Cycling - Mountain",
+        "category": "cycling",
+        "spec": {
+            "module_drawer_kind": "rounded",
+            "color_mask_kind": "vertical_gradient",
+            "back_color": (255, 255, 255),
+            "top_color": (46, 125, 50),
+            "bottom_color": (27, 94, 32),
+        },
+    },
+    {
+        "id": "cycling-roadie",
+        "name": "Cycling - Roadie",
+        "category": "cycling",
+        "spec": {
+            "module_drawer_kind": "vertical_bars",
+            "color_mask_kind": "solid",
+            "back_color": (255, 255, 255),
+            "front_color": (56, 142, 60),
+        },
+    },
+    {
+        "id": "cycling-criterium",
+        "name": "Cycling - Criterium",
+        "category": "cycling",
+        "spec": {
+            "module_drawer_kind": "gapped_square",
+            "color_mask_kind": "radial_gradient",
+            "back_color": (255, 255, 255),
+            "center_color": (205, 220, 57),
+            "edge_color": (33, 105, 49),
+        },
+    },
+    # --- swimming (3) ----------------------------------------------------
+    {
+        "id": "swimming-lagoon",
+        "name": "Swimming - Lagoon",
+        "category": "swimming",
+        "spec": {
+            "module_drawer_kind": "circle",
+            "color_mask_kind": "radial_gradient",
+            "back_color": (255, 255, 255),
+            "center_color": (0, 188, 212),
+            "edge_color": (1, 87, 155),
+        },
+    },
+    {
+        "id": "swimming-tide",
+        "name": "Swimming - Tide",
+        "category": "swimming",
+        "spec": {
+            "module_drawer_kind": "rounded",
+            "color_mask_kind": "vertical_gradient",
+            "back_color": (255, 255, 255),
+            "top_color": (3, 169, 244),
+            "bottom_color": (13, 71, 161),
+        },
+    },
+    {
+        "id": "swimming-pool",
+        "name": "Swimming - Pool",
+        "category": "swimming",
+        "spec": {
+            "module_drawer_kind": "horizontal_bars",
+            "color_mask_kind": "solid",
+            "back_color": (255, 255, 255),
+            "front_color": (2, 119, 189),
+        },
+    },
+    # --- business (3) ----------------------------------------------------
+    {
+        "id": "business-slate",
+        "name": "Business - Slate",
+        "category": "business",
+        "spec": {
+            "module_drawer_kind": "square",
+            "color_mask_kind": "solid",
+            "back_color": (255, 255, 255),
+            "front_color": (38, 50, 56),
+        },
+    },
+    {
+        "id": "business-navy",
+        "name": "Business - Navy",
+        "category": "business",
+        "spec": {
+            "module_drawer_kind": "rounded",
+            "color_mask_kind": "vertical_gradient",
+            "back_color": (255, 255, 255),
+            "top_color": (26, 35, 126),
+            "bottom_color": (13, 71, 161),
+        },
+    },
+    {
+        "id": "business-graphite",
+        "name": "Business - Graphite",
+        "category": "business",
+        "spec": {
+            "module_drawer_kind": "gapped_square",
+            "color_mask_kind": "solid",
+            "back_color": (255, 255, 255),
+            "front_color": (55, 71, 79),
+        },
+    },
+    # --- event (3) -------------------------------------------------------
+    {
+        "id": "event-festival",
+        "name": "Event - Festival",
+        "category": "event",
+        "spec": {
+            "module_drawer_kind": "rounded",
+            "color_mask_kind": "horizontal_gradient",
+            "back_color": (255, 255, 255),
+            "left_color": (171, 71, 188),
+            "right_color": (255, 87, 34),
+        },
+    },
+    {
+        "id": "event-concert",
+        "name": "Event - Concert",
+        "category": "event",
+        "spec": {
+            "module_drawer_kind": "circle",
+            "color_mask_kind": "radial_gradient",
+            "back_color": (255, 255, 255),
+            "center_color": (236, 64, 122),
+            "edge_color": (74, 20, 140),
+        },
+    },
+    {
+        "id": "event-conference",
+        "name": "Event - Conference",
+        "category": "event",
+        "spec": {
+            "module_drawer_kind": "square",
+            "color_mask_kind": "solid",
+            "back_color": (255, 255, 255),
+            "front_color": (49, 27, 146),
+        },
+    },
+    # --- wifi (3) --------------------------------------------------------
+    {
+        "id": "wifi-azure",
+        "name": "WiFi - Azure",
+        "category": "wifi",
+        "spec": {
+            "module_drawer_kind": "rounded",
+            "color_mask_kind": "radial_gradient",
+            "back_color": (255, 255, 255),
+            "center_color": (3, 169, 244),
+            "edge_color": (1, 87, 155),
+        },
+    },
+    {
+        "id": "wifi-mint",
+        "name": "WiFi - Mint",
+        "category": "wifi",
+        "spec": {
+            "module_drawer_kind": "circle",
+            "color_mask_kind": "horizontal_gradient",
+            "back_color": (255, 255, 255),
+            "left_color": (0, 137, 123),
+            "right_color": (38, 166, 154),
+        },
+    },
+    {
+        "id": "wifi-signal",
+        "name": "WiFi - Signal",
+        "category": "wifi",
+        "spec": {
+            "module_drawer_kind": "horizontal_bars",
+            "color_mask_kind": "solid",
+            "back_color": (255, 255, 255),
+            "front_color": (2, 136, 209),
+        },
+    },
+    # --- social (3) ------------------------------------------------------
+    {
+        "id": "social-bubblegum",
+        "name": "Social - Bubblegum",
+        "category": "social",
+        "spec": {
+            "module_drawer_kind": "rounded",
+            "color_mask_kind": "horizontal_gradient",
+            "back_color": (255, 255, 255),
+            "left_color": (236, 64, 122),
+            "right_color": (255, 152, 0),
+        },
+    },
+    {
+        "id": "social-aurora",
+        "name": "Social - Aurora",
+        "category": "social",
+        "spec": {
+            "module_drawer_kind": "circle",
+            "color_mask_kind": "vertical_gradient",
+            "back_color": (255, 255, 255),
+            "top_color": (123, 31, 162),
+            "bottom_color": (3, 169, 244),
+        },
+    },
+    {
+        "id": "social-sunrise",
+        "name": "Social - Sunrise",
+        "category": "social",
+        "spec": {
+            "module_drawer_kind": "rounded",
+            "color_mask_kind": "radial_gradient",
+            "back_color": (255, 255, 255),
+            "center_color": (255, 213, 79),
+            "edge_color": (244, 81, 30),
+        },
+    },
+    # --- personal (3) ----------------------------------------------------
+    {
+        "id": "personal-forest",
+        "name": "Personal - Forest",
+        "category": "personal",
+        "spec": {
+            "module_drawer_kind": "rounded",
+            "color_mask_kind": "vertical_gradient",
+            "back_color": (255, 255, 255),
+            "top_color": (46, 125, 50),
+            "bottom_color": (27, 94, 32),
+        },
+    },
+    {
+        "id": "personal-plum",
+        "name": "Personal - Plum",
+        "category": "personal",
+        "spec": {
+            "module_drawer_kind": "circle",
+            "color_mask_kind": "solid",
+            "back_color": (255, 255, 255),
+            "front_color": (106, 27, 154),
+        },
+    },
+    {
+        "id": "personal-denim",
+        "name": "Personal - Denim",
+        "category": "personal",
+        "spec": {
+            "module_drawer_kind": "gapped_square",
+            "color_mask_kind": "horizontal_gradient",
+            "back_color": (255, 255, 255),
+            "left_color": (40, 53, 147),
+            "right_color": (92, 107, 192),
+        },
+    },
+]
+
+
+_DRAWER_FACTORIES = {
+    "square": SquareModuleDrawer,
+    "rounded": RoundedModuleDrawer,
+    "circle": CircleModuleDrawer,
+    "gapped_square": GappedSquareModuleDrawer,
+    "vertical_bars": VerticalBarsDrawer,
+    "horizontal_bars": HorizontalBarsDrawer,
+}
+
+
+def _resolve_drawer(kind: str):
+    """Return a fresh module-drawer instance for ``kind``.
+
+    Raises :class:`ValueError` if ``kind`` is not one of the registered
+    drawer kinds. The registry is closed on purpose so a typo in the
+    template data raises eagerly rather than silently rendering as
+    ``SquareModuleDrawer``.
+    """
+    factory = _DRAWER_FACTORIES.get(kind)
+    if factory is None:
+        raise ValueError(f"unknown module_drawer_kind: {kind!r}")
+    return factory()
+
+
+def _resolve_color_mask(spec: dict):
+    """Build the right ``color_mask`` instance from a template ``spec``.
+
+    Raises :class:`ValueError` on an unknown ``color_mask_kind`` or on a
+    missing colour stop required by the chosen mask.
+    """
+    kind = spec.get("color_mask_kind")
+    back = spec.get("back_color", (255, 255, 255))
+    if kind == "solid":
+        front = spec.get("front_color")
+        if front is None:
+            raise ValueError("solid mask requires front_color")
+        return SolidFillColorMask(back_color=back, front_color=front)
+    if kind == "radial_gradient":
+        center = spec.get("center_color")
+        edge = spec.get("edge_color")
+        if center is None or edge is None:
+            raise ValueError(
+                "radial_gradient mask requires center_color and edge_color",
+            )
+        return RadialGradiantColorMask(
+            back_color=back, center_color=center, edge_color=edge,
+        )
+    if kind == "square_gradient":
+        center = spec.get("center_color")
+        edge = spec.get("edge_color")
+        if center is None or edge is None:
+            raise ValueError(
+                "square_gradient mask requires center_color and edge_color",
+            )
+        return SquareGradiantColorMask(
+            back_color=back, center_color=center, edge_color=edge,
+        )
+    if kind == "horizontal_gradient":
+        left = spec.get("left_color")
+        right = spec.get("right_color")
+        if left is None or right is None:
+            raise ValueError(
+                "horizontal_gradient mask requires left_color and right_color",
+            )
+        return HorizontalGradiantColorMask(
+            back_color=back, left_color=left, right_color=right,
+        )
+    if kind == "vertical_gradient":
+        top = spec.get("top_color")
+        bottom = spec.get("bottom_color")
+        if top is None or bottom is None:
+            raise ValueError(
+                "vertical_gradient mask requires top_color and bottom_color",
+            )
+        return VerticalGradiantColorMask(
+            back_color=back, top_color=top, bottom_color=bottom,
+        )
+    raise ValueError(f"unknown color_mask_kind: {kind!r}")
+
+
+def list_templates() -> list[dict]:
+    """Return a defensive deep copy of the built-in :data:`TEMPLATES` list.
+
+    The returned list has the same shape as :data:`TEMPLATES` (each entry
+    is a dict with ``id``, ``name``, ``category``, ``spec``). Callers are
+    free to mutate the result without affecting the registry.
+    """
+    return copy.deepcopy(TEMPLATES)
+
+
+def get_template(template_id: str) -> dict:
+    """Look up a template by its slug ``id``.
+
+    Returns a deep copy of the matching entry. Raises :class:`ValueError`
+    with a clear message if no template with that id exists; this is the
+    error shape the HTTP layer turns into a clean 400/404.
+    """
+    for entry in TEMPLATES:
+        if entry["id"] == template_id:
+            return copy.deepcopy(entry)
+    raise ValueError(f"unknown template id: {template_id}")
+
+
+def _pad_logo(logo: Image.Image, target_size_px: int) -> Image.Image:
+    """Wrap ``logo`` in a white rounded-square pad.
+
+    ``StyledPilImage`` pastes the supplied embedded image as-is, so
+    without a white background ring around the logo the QR's modules
+    can clip the logo's outline. This helper paints a slightly rounded
+    white square the size of ``target_size_px``, fits the logo into
+    about 80% of that area centred inside it, and returns the result
+    as an RGBA image. The 80% pad leaves a small white margin on every
+    side, which is what keeps the QR scannable.
+    """
+    if target_size_px <= 0:
+        raise ValueError("target_size_px must be > 0")
+
+    # Build the white rounded-square pad as the base canvas.
+    pad = Image.new("RGBA", (target_size_px, target_size_px), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(pad)
+    radius = max(2, target_size_px // 8)
+    draw.rounded_rectangle(
+        [(0, 0), (target_size_px - 1, target_size_px - 1)],
+        radius=radius,
+        fill=(255, 255, 255, 255),
+    )
+
+    # Fit the logo into ~80% of the pad while preserving aspect ratio.
+    inner = max(1, int(target_size_px * 0.80))
+    work = logo.convert("RGBA").copy()
+    work.thumbnail((inner, inner), Image.LANCZOS)
+
+    offset_x = (target_size_px - work.width) // 2
+    offset_y = (target_size_px - work.height) // 2
+    pad.paste(work, (offset_x, offset_y), mask=work)
+    return pad
+
+
+def _is_default_template(template_id: str | None) -> bool:
+    """Return True if ``template_id`` represents the legacy plain render."""
+    return template_id is None or template_id == "default"
 
 
 def generate_qr(
@@ -81,14 +763,29 @@ def generate_qr(
     box_size: int = 10,
     border: int = 4,
     label_height: int | None = None,
+    template_id: str | None = None,
+    logo: Image.Image | None = None,
 ) -> Image.Image:
     """Render ``data`` as a QR code and optionally overlay a label on it.
 
-    The QR is built with :data:`qrcode.constants.ERROR_CORRECT_M`. When
-    ``label`` is provided, a small white badge is drawn at the bottom
-    center of the QR image and the label text is rendered on top of it.
-    The QR remains scannable because error correction level M tolerates
-    up to 15% damage.
+    When neither ``template_id`` nor ``logo`` is supplied (the common
+    case), the QR is built with :data:`qrcode.constants.ERROR_CORRECT_M`
+    and rendered via the legacy ``qr.make_image(fill_color, back_color)``
+    path, byte-for-byte identical to earlier releases.
+
+    When ``template_id`` is supplied (and is not the literal ``default``),
+    the QR is rendered through ``qrcode.image.styledpil.StyledPilImage``
+    using the template's module drawer and colour mask. When ``logo`` is
+    supplied, error correction is bumped to
+    :data:`qrcode.constants.ERROR_CORRECT_H` (15%-30% recovery vs M's
+    15%) and the logo is wrapped in a white rounded-square pad before
+    being passed in as ``embedded_image`` so the QR remains scannable.
+    A payload that fits at M but exceeds the H-mode capacity will raise
+    :class:`ValueError` from inside the underlying ``qrcode`` library.
+
+    The optional ``label`` is overlaid on top of the rendered QR via
+    :class:`PIL.ImageDraw.ImageDraw` exactly the same way for both the
+    legacy and the styled paths, so labels keep working on styled QRs.
 
     Parameters
     ----------
@@ -103,20 +800,61 @@ def generate_qr(
     label_height:
         Height in pixels of the overlay badge. When ``None`` (the default),
         a value proportional to the QR size is chosen.
+    template_id:
+        Optional template slug. ``None`` and ``"default"`` both take the
+        legacy plain-black-on-white render path. Any other id is resolved
+        via :func:`get_template` (raises :class:`ValueError` on unknown).
+    logo:
+        Optional :class:`PIL.Image.Image` to embed at the centre of the
+        QR. When supplied, error correction is upgraded to
+        ``ERROR_CORRECT_H`` and the logo is pre-wrapped in a white
+        rounded-square pad. If only ``logo`` is supplied without a
+        template, the ``default`` template (plain black on white) is
+        used as the colour mask.
 
     Returns
     -------
     PIL.Image.Image
         RGB image of the rendered QR (with label overlay, if provided).
     """
-    qr = qrcode.QRCode(
-        error_correction=ERROR_CORRECT_M,
-        box_size=box_size,
-        border=border,
-    )
-    qr.add_data(data)
-    qr.make(fit=True)
-    qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    use_styled = not _is_default_template(template_id) or logo is not None
+
+    if not use_styled:
+        # --- Legacy fast path: byte-for-byte identical to earlier releases.
+        qr = qrcode.QRCode(
+            error_correction=ERROR_CORRECT_M,
+            box_size=box_size,
+            border=border,
+        )
+        qr.add_data(data)
+        qr.make(fit=True)
+        qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    else:
+        # --- Styled path: StyledPilImage with optional embedded logo.
+        spec_id = template_id if template_id is not None else "default"
+        template = get_template(spec_id)
+        spec = template["spec"]
+        drawer = _resolve_drawer(spec["module_drawer_kind"])
+        color_mask = _resolve_color_mask(spec)
+
+        error_correction = ERROR_CORRECT_H if logo is not None else ERROR_CORRECT_M
+        qr = qrcode.QRCode(
+            error_correction=error_correction,
+            box_size=box_size,
+            border=border,
+        )
+        qr.add_data(data)
+        qr.make(fit=True)
+
+        embedded_image = _pad_logo(logo, LOGO_WORK_SIZE) if logo is not None else None
+        styled = qr.make_image(
+            image_factory=StyledPilImage,
+            module_drawer=drawer,
+            color_mask=color_mask,
+            embedded_image=embedded_image,
+            embedded_image_ratio=0.22,
+        )
+        qr_img = styled.get_image().convert("RGB")
 
     if label is None:
         return qr_img
@@ -167,6 +905,27 @@ def generate_qr(
     draw.text((text_x, text_y), label, fill="black", font=font)
 
     return qr_img
+
+
+def render_template_preview(template_id: str) -> bytes:
+    """Render a small thumbnail PNG for ``template_id``.
+
+    The preview encodes a fixed short payload (``"XlumaQR"``) at a small
+    box size so the result stays light enough to ship in an HTTP response
+    cheaply. This function is pure: no caching, no I/O. The HTTP layer
+    is free to memoise its results in a per-process dict.
+
+    Raises :class:`ValueError` if ``template_id`` is not in the registry.
+    """
+    image = generate_qr(
+        "XlumaQR",
+        box_size=4,
+        border=2,
+        template_id=template_id,
+    )
+    buf = io.BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def compute_range(
@@ -237,6 +996,8 @@ def generate_sequence(
     prefix: str = "",
     box_size: int = 10,
     border: int = 4,
+    template_id: str | None = None,
+    logo: Image.Image | None = None,
 ) -> Iterator[tuple[str, Image.Image]]:
     """Yield ``(filename, PIL.Image.Image)`` pairs for a sequential range.
 
@@ -251,6 +1012,12 @@ def generate_sequence(
     Pass ``label_template=None`` to disable the printed label.
 
     The emitted filename is ``f"{prefix}{padded_n}.png"``.
+
+    The optional ``template_id`` and ``logo`` parameters are forwarded to
+    each :func:`generate_qr` call so every QR in the sequence is rendered
+    with the same design and embedded logo. The defaults preserve the
+    legacy plain-black-on-white render path so existing call sites are
+    unaffected.
     """
     numbers = compute_range(start, count=count, end=end, padding=padding)
     for n in numbers:
@@ -261,6 +1028,8 @@ def generate_sequence(
             label=label,
             box_size=box_size,
             border=border,
+            template_id=template_id,
+            logo=logo,
         )
         yield f"{prefix}{n}.png", image
 

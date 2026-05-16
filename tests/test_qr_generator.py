@@ -317,3 +317,269 @@ def test_iter_batch_with_progress_propagates_encoder_error() -> None:
     # propagates through the helper.
     with pytest.raises(ValueError, match="payload too large"):
         next(gen)
+
+
+# --- Custom QR designs (FEAT-001) -----------------------------------
+
+
+def test_list_templates_has_at_least_30_with_required_categories() -> None:
+    """The built-in templates registry must satisfy the task contract:
+    >= 30 entries, every required sport category present, >= 3 entries
+    per required category, the four documented fields on every entry."""
+    from qr_generator import list_templates
+
+    templates = list_templates()
+    assert len(templates) >= 30
+
+    required_categories = {
+        "marathon",
+        "running",
+        "duathlon",
+        "triathlon",
+        "cycling",
+        "swimming",
+    }
+    seen = {t["category"] for t in templates}
+    assert required_categories.issubset(seen), (
+        f"missing categories: {required_categories - seen}"
+    )
+
+    counts: dict[str, int] = {}
+    for t in templates:
+        # Every entry has the four documented fields.
+        assert set(t.keys()) >= {"id", "name", "category", "spec"}
+        assert isinstance(t["id"], str) and t["id"]
+        assert isinstance(t["name"], str) and t["name"]
+        assert isinstance(t["category"], str) and t["category"]
+        assert isinstance(t["spec"], dict)
+        counts[t["category"]] = counts.get(t["category"], 0) + 1
+
+    for cat in required_categories:
+        assert counts.get(cat, 0) >= 3, f"category {cat} has only {counts.get(cat, 0)} entries"
+
+    # The reserved default template exists with the documented category.
+    default_entries = [t for t in templates if t["id"] == "default"]
+    assert len(default_entries) == 1
+    assert default_entries[0]["category"] == "default"
+
+
+def test_list_templates_returns_defensive_copy() -> None:
+    """Mutating the returned list must not affect the underlying registry."""
+    from qr_generator import list_templates
+
+    a = list_templates()
+    a.clear()
+    b = list_templates()
+    assert len(b) >= 30
+
+
+def test_get_template_returns_matching_entry() -> None:
+    from qr_generator import get_template
+
+    entry = get_template("default")
+    assert entry["id"] == "default"
+    assert entry["category"] == "default"
+
+
+def test_get_template_unknown_raises() -> None:
+    from qr_generator import get_template
+
+    with pytest.raises(ValueError, match="unknown template id"):
+        get_template("does-not-exist")
+
+
+def test_template_renders_styled_pixels_differ_from_default() -> None:
+    """A coloured template must actually colour the QR modules.
+
+    We pick ``running-track`` which is a solid red front colour and
+    compare a known-active QR-module pixel between the styled render
+    and the legacy render. The legacy render is plain black at that
+    coordinate; the styled render must NOT be plain black.
+    """
+    from qr_generator import generate_qr
+
+    legacy = generate_qr("hello").convert("RGB")
+    styled = generate_qr("hello", template_id="running-track").convert("RGB")
+
+    assert isinstance(legacy, Image.Image)
+    assert isinstance(styled, Image.Image)
+    assert legacy.size == styled.size
+
+    # box_size=10, border=4 by default => the position-pattern modules
+    # start at pixel 40 and run through pixel ~110. Pick a coordinate
+    # we know is inside an active QR module on the legacy render.
+    sample = (60, 60)
+    legacy_px = legacy.getpixel(sample)
+    styled_px = styled.getpixel(sample)
+    assert legacy_px == (0, 0, 0), (
+        "expected a black module on the legacy render at the sample "
+        "coordinate; got " + repr(legacy_px)
+    )
+    assert styled_px != (0, 0, 0), (
+        "expected the styled render to colour the module, not leave it "
+        "black; got " + repr(styled_px)
+    )
+
+
+def test_logo_centre_pixels_match_logo_colour() -> None:
+    """An embedded logo must show through at the centre of the QR.
+
+    Build a 100x100 solid-orange RGB logo, render with and without
+    embedding it, and assert the centre pixel of the rendered image is
+    in the orange ballpark when a logo is supplied and is pure black or
+    white when it is not.
+    """
+    from qr_generator import generate_qr
+
+    logo = Image.new("RGB", (100, 100), (255, 165, 0))
+    with_logo = generate_qr("hello", logo=logo).convert("RGB")
+    without_logo = generate_qr("hello").convert("RGB")
+
+    cx, cy = with_logo.size[0] // 2, with_logo.size[1] // 2
+    px = with_logo.getpixel((cx, cy))
+    r, g, b = px
+    assert r >= 200, f"red channel too low at logo centre: {px}"
+    assert 100 <= g <= 200, f"green channel out of orange ballpark at logo centre: {px}"
+    assert b <= 80, f"blue channel too high at logo centre: {px}"
+
+    # Control: same render without a logo must be pure black or white at
+    # the centre (i.e. the QR's monochrome render).
+    cx2, cy2 = without_logo.size[0] // 2, without_logo.size[1] // 2
+    bw = without_logo.getpixel((cx2, cy2))
+    assert bw in {(0, 0, 0), (255, 255, 255)}, (
+        f"expected pure black or white at the centre of an unlogo'd QR; got {bw}"
+    )
+
+
+def test_logo_bumps_error_correction_to_h() -> None:
+    """A logo upgrades error correction to H, which lowers the per-payload
+    capacity. A payload that fits at M (no logo) overflows at H (logo).
+    """
+    from qr_generator import generate_qr
+
+    logo = Image.new("RGB", (32, 32), (255, 165, 0))
+
+    # Without the logo we stay at M and 'A' * 2000 fits at version 40.
+    img = generate_qr("A" * 2000)
+    assert isinstance(img, Image.Image)
+
+    # With the logo we move to H and the same payload exceeds the H-mode
+    # capacity, surfacing as a ValueError from the underlying qrcode
+    # library.
+    with pytest.raises(ValueError):
+        generate_qr("A" * 2000, logo=logo)
+
+
+def test_render_template_preview_returns_png_bytes_for_every_template() -> None:
+    """Every template in the registry must produce a renderable PNG
+    thumbnail. This catches typos in colour stop names and unknown
+    drawer / mask kinds in the template specs."""
+    from qr_generator import list_templates, render_template_preview
+
+    for t in list_templates():
+        png = render_template_preview(t["id"])
+        assert isinstance(png, (bytes, bytearray))
+        assert png.startswith(PNG_MAGIC), (
+            f"template {t['id']!r} did not produce PNG magic bytes"
+        )
+
+
+def test_render_template_preview_unknown_raises() -> None:
+    from qr_generator import render_template_preview
+
+    with pytest.raises(ValueError, match="unknown template id"):
+        render_template_preview("does-not-exist")
+
+
+def test_legacy_path_byte_identical_when_no_template_no_logo() -> None:
+    """The legacy ``generate_qr`` fast path is preserved byte-for-byte
+    when neither a template nor a logo is supplied. This is the
+    regression guard that keeps the existing 52 tests honest.
+
+    Three calls must all produce the identical raw image bytes:
+      * ``generate_qr('hello')`` (no new arguments at all)
+      * ``generate_qr('hello', template_id=None, logo=None)``
+        (explicitly passing the documented defaults)
+      * ``generate_qr('hello', template_id='default')``
+        (the reserved 'default' id maps onto the legacy path)
+    """
+    from qr_generator import generate_qr
+
+    a = generate_qr("hello")
+    b = generate_qr("hello", template_id=None, logo=None)
+    c = generate_qr("hello", template_id="default")
+
+    assert a.size == b.size == c.size
+    assert a.tobytes() == b.tobytes()
+    assert a.tobytes() == c.tobytes()
+
+
+def test_generate_sequence_forwards_template_id_to_each_item() -> None:
+    """When ``template_id`` is supplied to ``generate_sequence`` it is
+    forwarded into each ``generate_qr`` call so every QR in the batch
+    is styled. We assert this by comparing the encoded PNG bytes of an
+    item from a styled sequence against a styled single render and
+    against a legacy single render."""
+    from qr_generator import generate_qr, generate_sequence
+
+    styled_items = list(
+        generate_sequence(
+            start=1,
+            count=2,
+            data_template="{n}",
+            label_template=None,
+            template_id="running-track",
+        )
+    )
+    assert len(styled_items) == 2
+    name, image = styled_items[0]
+    assert name == "1.png"
+
+    expected_styled = generate_qr("1", template_id="running-track")
+    expected_legacy = generate_qr("1")
+
+    actual_buf = io.BytesIO()
+    image.save(actual_buf, format="PNG")
+    styled_buf = io.BytesIO()
+    expected_styled.save(styled_buf, format="PNG")
+    legacy_buf = io.BytesIO()
+    expected_legacy.save(legacy_buf, format="PNG")
+
+    assert actual_buf.getvalue() == styled_buf.getvalue()
+    assert actual_buf.getvalue() != legacy_buf.getvalue()
+
+
+def test_generate_sequence_forwards_logo_to_each_item() -> None:
+    """A supplied logo must show up in every QR of the batch, not just
+    the first. We verify by rendering a tiny sequence and asserting the
+    centre pixel of each rendered image is in the logo's colour
+    ballpark."""
+    from qr_generator import generate_sequence
+
+    logo = Image.new("RGB", (64, 64), (255, 165, 0))
+    items = list(
+        generate_sequence(
+            start=1,
+            count=3,
+            data_template="{n}",
+            label_template=None,
+            logo=logo,
+        )
+    )
+    assert len(items) == 3
+    for _, image in items:
+        rgb = image.convert("RGB")
+        cx, cy = rgb.size[0] // 2, rgb.size[1] // 2
+        r, g, b = rgb.getpixel((cx, cy))
+        assert r >= 200 and 100 <= g <= 200 and b <= 80, (
+            f"expected orange ballpark at QR centre; got {(r, g, b)}"
+        )
+
+
+def test_max_logo_constants_exposed() -> None:
+    """The HTTP layer relies on these constants for upload validation."""
+    from qr_generator import LOGO_WORK_SIZE, MAX_LOGO_BYTES, MAX_LOGO_DIMENSION
+
+    assert MAX_LOGO_BYTES == 2 * 1024 * 1024
+    assert MAX_LOGO_DIMENSION == 1024
+    assert LOGO_WORK_SIZE == 256
