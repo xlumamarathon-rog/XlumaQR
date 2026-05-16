@@ -37,6 +37,7 @@ Public API
 from __future__ import annotations
 
 import copy
+import functools
 import io
 import os
 import zipfile
@@ -789,6 +790,7 @@ def _label_color_from_spec(spec: dict) -> tuple[int, int, int]:
     raise ValueError(f"unknown color_mask_kind: {kind!r}")
 
 
+@functools.lru_cache(maxsize=64)
 def _load_label_font(size_px: int):
     """Return the bundled Plus Jakarta Sans Bold TTF at ``size_px``.
 
@@ -796,6 +798,14 @@ def _load_label_font(size_px: int):
     open the bundled file (``OSError``). The fallback is purely
     defensive: the font ships with the source tree at
     :data:`LABEL_FONT_PATH` so the truetype path is the expected one.
+
+    Cached by ``size_px`` because :data:`LABEL_FONT_PATH` is module-
+    constant. The centre-badge autofit loop in
+    :func:`_render_label_badge` walks a range of font sizes (4 px
+    steps from ~30% of ``LOGO_WORK_SIZE`` down to a 24 px floor); on
+    a long label that case can be ~70 iterations, and re-parsing the
+    TTF on every step adds up. ``maxsize=64`` covers the entire
+    autofit range plus typical band-below sizes with room to spare.
     """
     try:
         return ImageFont.truetype(LABEL_FONT_PATH, size_px)

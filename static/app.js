@@ -300,42 +300,70 @@
   // on click the button POSTs a fresh request to /api/qr/single with
   // ``box_size`` forced to HD_BOX_SIZE and downloads the resulting
   // higher-resolution PNG instead of the cached preview Blob. Two
-  // shapes are accepted:
+  // shapes are accepted, and they honour DIFFERENT contracts about
+  // when form state is read:
   //
-  //   { form, fields, fileFields }
-  //     Used by the Single QR submit handler. The button copies the
-  //     listed text fields from ``form.elements`` and the listed file
-  //     inputs (by name, reading ``.files[0]``) into a fresh FormData,
-  //     overrides ``box_size`` with HD_BOX_SIZE, and POSTs.
+  //   { form, fields, fileFields, inflightSlot }
+  //     Used by the Single QR submit handler. The button reads
+  //     ``form.elements`` AT CLICK TIME, so any edits the user made
+  //     between the preview submit and the download click are picked
+  //     up. This is the right contract for Single because the user
+  //     sees the form right next to the preview, can keep typing
+  //     after the preview lands, and naturally expects "download
+  //     what I currently see in the form".
   //
-  //   { formData }
+  //   { formData, inflightSlot }
   //     Used by the Batch live preview, where the on-screen QR is
   //     rendered with substituted ``data`` / ``label`` values (the
-  //     padded first range item, with ``{n}`` resolved). The HD
-  //     download must encode the SAME substituted payload, not the
-  //     raw ``{n}`` template, so the caller pre-builds a FormData
-  //     that mirrors the preview request and passes it here. The
-  //     button overrides ``box_size`` with HD_BOX_SIZE on click.
+  //     padded first range item, with ``{n}`` resolved). The caller
+  //     PRE-BUILDS a FormData that mirrors the preview request and
+  //     passes it here, so the click reads form state AT PREVIEW
+  //     TIME, not at click time. This is intentionally asymmetric
+  //     with Single: the Batch preview is explicitly a sample of
+  //     "what each generated QR will look like for the substituted
+  //     data and template", and the user is downloading THAT visible
+  //     sample. Picking up edits at click time would silently encode
+  //     a payload that does not match the preview the user is
+  //     looking at. Most Batch field edits are wired to
+  //     scheduleBatchPreview, so a real edit will redraw the preview
+  //     (and rebuild the captured FormData) before the user clicks
+  //     download.
+  //
+  // ``inflightSlot`` (optional) is a per-pane cancellation slot of
+  // the shape ``{ controller: AbortController | null }`` owned by the
+  // call site. The helper writes its in-flight HD-fetch controller
+  // into ``slot.controller`` for the duration of the fetch, so the
+  // call site can abort the fetch when its preview pane is about to
+  // be redrawn (any time ``previewEl.innerHTML = ""`` is about to
+  // run). Without this hook a redraw would orphan the in-flight HD
+  // fetch and a stale download would land after the user has moved
+  // on. Per-button second-click cancellation works the same way it
+  // did before via the local ``inflight`` closure.
   //
   // If ``hdRefetchOpts`` is omitted the button reverts to today's
   // behaviour: just download the cached preview Blob.
   //
   // If the HD fetch fails (network, encoder error, abort from a
-  // re-click), the button falls back to downloading the cached
-  // preview Blob so the user still gets a file.
+  // re-click or redraw), the button falls back to downloading the
+  // cached preview Blob so the user still gets a file - except on
+  // AbortError, where the user explicitly moved on and a fallback
+  // download would be unwelcome.
   function appendPreviewDownloadButton(previewEl, blob, filename, hdRefetchOpts) {
     var btn = document.createElement("button");
     btn.type = "button";
     btn.className = "primary preview-download";
     btn.textContent = "Download HD PNG";
     btn.title =
-      "Re-renders at high resolution (~1480 px per side at default border) before downloading.";
+      "Re-renders at high resolution (~1640 px per side at default border for a typical URL payload) before downloading.";
 
-    // Per-button AbortController so a second click (or a redraw that
-    // leaves the previous button orphaned) can cancel the in-flight
-    // HD fetch instead of letting an outdated download arrive after
-    // the user has moved on.
+    // Per-button AbortController so a second click on the SAME button
+    // can cancel its previous in-flight fetch. Cross-button orphaning
+    // (a redraw replaces ``previewEl.innerHTML`` while a fetch from
+    // the previous button is still in flight) is handled separately
+    // via ``hdRefetchOpts.inflightSlot`` so the call site can abort
+    // the fetch before the redraw runs.
     var inflight = null;
+    var inflightSlot = hdRefetchOpts && hdRefetchOpts.inflightSlot;
 
     btn.addEventListener("click", function () {
       if (!hdRefetchOpts) {
@@ -383,6 +411,19 @@
       }
       var controller = new AbortController();
       inflight = controller;
+      // Also publish the controller through the per-pane slot so a
+      // redraw of the preview pane can cancel an orphaned fetch.
+      if (inflightSlot) {
+        // If a prior orphaned fetch is still attached to the slot
+        // (from a button that was detached without firing its own
+        // second-click), abort it so its eventual completion does
+        // not trigger a stale download. In normal flow the slot is
+        // already cleared by the previous fetch's restoration arm.
+        if (inflightSlot.controller && inflightSlot.controller !== controller) {
+          inflightSlot.controller.abort();
+        }
+        inflightSlot.controller = controller;
+      }
 
       var originalText = btn.textContent;
       btn.disabled = true;
@@ -423,6 +464,13 @@
             btn.disabled = false;
             btn.textContent = originalText;
           }
+          // Clear the per-pane slot only if it still points at us.
+          // A redraw that aborted us has already moved the slot on,
+          // and a second click on the same button has already
+          // overwritten the slot with the newer controller.
+          if (inflightSlot && inflightSlot.controller === controller) {
+            inflightSlot.controller = null;
+          }
         });
     });
     previewEl.appendChild(btn);
@@ -433,6 +481,19 @@
   var singlePreview = document.getElementById("single-preview");
   var singleError = document.getElementById("single-error");
   var lastBlobUrl = null;
+  // Cancellation slot for the Single pane's HD-download button. The
+  // helper publishes its in-flight AbortController here, and the
+  // submit success arm aborts it before clearing the preview so an
+  // orphaned HD fetch from the previous button cannot trigger a
+  // stale download after the new preview has rendered.
+  var singleHdInflight = { controller: null };
+
+  function abortHdInflight(slot) {
+    if (slot && slot.controller) {
+      slot.controller.abort();
+      slot.controller = null;
+    }
+  }
 
   if (singleForm) {
     singleForm.addEventListener("submit", function (event) {
@@ -460,6 +521,11 @@
             URL.revokeObjectURL(lastBlobUrl);
           }
           lastBlobUrl = URL.createObjectURL(blob);
+          // Cancel any in-flight HD fetch from a previous button
+          // before tearing down its pane: ``innerHTML = ""`` would
+          // otherwise orphan the fetch and a stale download would
+          // land after this fresh preview has rendered.
+          abortHdInflight(singleHdInflight);
           singlePreview.innerHTML = "";
           var img = document.createElement("img");
           img.alt = "Generated QR code";
@@ -478,6 +544,7 @@
             form: singleForm,
             fields: ["data", "label", "border", "template_id"],
             fileFields: ["logo"],
+            inflightSlot: singleHdInflight,
           });
         })
         .catch(function (err) {
@@ -535,6 +602,12 @@
   var batchPreviewBlobUrl = null;
   var batchPreviewTimer = null;
   var batchPreviewIncludeLogo = false;
+  // Cancellation slot for the Batch pane's HD-download button. Same
+  // role as ``singleHdInflight``: every redraw path that clears the
+  // batch preview pane (refreshBatchPreview's success arm,
+  // setBatchPreviewMessage) aborts this slot so an orphaned HD fetch
+  // from the previous button cannot trigger a stale download.
+  var batchHdInflight = { controller: null };
 
   function scheduleBatchPreview(opts) {
     // ``opts.includeLogo`` is sticky across the debounce window: if
@@ -552,6 +625,11 @@
 
   function setBatchPreviewMessage(message) {
     if (!batchPreview) return;
+    // Cancel any in-flight HD fetch from a previous button before
+    // replacing the pane's contents: ``innerHTML = ""`` would
+    // otherwise orphan the fetch and a stale download would land
+    // after the message replaces the QR preview.
+    abortHdInflight(batchHdInflight);
     batchPreview.innerHTML = "";
     var p = document.createElement("p");
     p.className = "preview-empty";
@@ -655,6 +733,11 @@
           URL.revokeObjectURL(batchPreviewBlobUrl);
         }
         batchPreviewBlobUrl = URL.createObjectURL(blob);
+        // Cancel any in-flight HD fetch from a previous button
+        // before tearing down its pane: ``innerHTML = ""`` would
+        // otherwise orphan the fetch and a stale download would land
+        // after this fresh preview has rendered.
+        abortHdInflight(batchHdInflight);
         batchPreview.innerHTML = "";
         var img = document.createElement("img");
         img.alt = "Batch sample QR preview";
@@ -698,7 +781,7 @@
           batchPreview,
           blob,
           "qr_" + paddedFirst + ".png",
-          { formData: hdFormData }
+          { formData: hdFormData, inflightSlot: batchHdInflight }
         );
       })
       .catch(function (err) {
