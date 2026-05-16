@@ -87,6 +87,49 @@
               />
             </div>
           </div>
+
+          <fieldset class="row design-section" data-form="single">
+            <legend>Design (optional)</legend>
+            <div class="row">
+              <label for="single-template-category">Template category</label>
+              <select
+                id="single-template-category"
+                class="category-select"
+                data-form="single"
+              ></select>
+            </div>
+            <div
+              id="single-template-grid"
+              class="template-grid"
+              data-form="single"
+            ></div>
+            <input
+              type="hidden"
+              id="single-template-id"
+              name="template_id"
+              value="default"
+            />
+            <div class="row logo-upload-row">
+              <label for="single-logo">Centre logo (optional, PNG or JPEG)</label>
+              <div class="logo-upload-controls">
+                <input
+                  type="file"
+                  id="single-logo"
+                  name="logo"
+                  accept="image/png,image/jpeg"
+                  data-form="single"
+                />
+                <button
+                  type="button"
+                  class="logo-clear-btn"
+                  data-form="single"
+                >
+                  Clear logo
+                </button>
+              </div>
+            </div>
+          </fieldset>
+
           <div class="row">
             <button type="submit" class="primary">Generate</button>
           </div>
@@ -219,6 +262,48 @@
               </div>
             </div>
           </div>
+
+          <fieldset class="row design-section" data-form="batch">
+            <legend>Design (optional)</legend>
+            <div class="row">
+              <label for="batch-template-category">Template category</label>
+              <select
+                id="batch-template-category"
+                class="category-select"
+                data-form="batch"
+              ></select>
+            </div>
+            <div
+              id="batch-template-grid"
+              class="template-grid"
+              data-form="batch"
+            ></div>
+            <input
+              type="hidden"
+              id="batch-template-id"
+              name="template_id"
+              value="default"
+            />
+            <div class="row logo-upload-row">
+              <label for="batch-logo">Centre logo (optional, PNG or JPEG)</label>
+              <div class="logo-upload-controls">
+                <input
+                  type="file"
+                  id="batch-logo"
+                  name="logo"
+                  accept="image/png,image/jpeg"
+                  data-form="batch"
+                />
+                <button
+                  type="button"
+                  class="logo-clear-btn"
+                  data-form="batch"
+                >
+                  Clear logo
+                </button>
+              </div>
+            </div>
+          </fieldset>
 
           <fieldset class="row format-toggle">
             <legend>Download format</legend>

@@ -30,6 +30,177 @@
     });
   });
 
+  // ---- Template gallery (Design sections) --------------------------
+  //
+  // On DOMContentLoaded (this IIFE runs at the end of the body, so the
+  // DOM is already ready by the time we get here) we fetch the
+  // /api/qr/templates listing once. The result is grouped by category,
+  // each category populates the dropdown on both forms, and switching
+  // categories lazily renders the matching tiles. Selecting a tile sets
+  // the form's hidden template_id input and (on the Single QR form
+  // only) re-triggers a submit so the live preview refreshes.
+  //
+  // Categories are sorted to a stable order: "default" first, then the
+  // sport categories in a deliberate order, then the remaining
+  // categories alphabetically. This keeps the dropdown predictable
+  // across reloads even if the registry ordering ever changes.
+  var SPORT_ORDER = [
+    "marathon",
+    "running",
+    "duathlon",
+    "triathlon",
+    "cycling",
+    "swimming",
+  ];
+
+  function categoryRank(cat) {
+    if (cat === "default") return 0;
+    var i = SPORT_ORDER.indexOf(cat);
+    if (i !== -1) return 1 + i;
+    return 100; // general categories sorted alphabetically below
+  }
+
+  function compareCategories(a, b) {
+    var ra = categoryRank(a);
+    var rb = categoryRank(b);
+    if (ra !== rb) return ra - rb;
+    return a < b ? -1 : a > b ? 1 : 0;
+  }
+
+  function setupDesignSection(formKey, onTemplateChange) {
+    var select = document.getElementById(formKey + "-template-category");
+    var grid = document.getElementById(formKey + "-template-grid");
+    var hidden = document.getElementById(formKey + "-template-id");
+    var logoInput = document.getElementById(formKey + "-logo");
+    var clearBtn = document.querySelector(
+      '.logo-clear-btn[data-form="' + formKey + '"]'
+    );
+    if (!select || !grid || !hidden) {
+      return null;
+    }
+
+    var byCategory = {};
+    var orderedCategories = [];
+
+    function renderGrid(category) {
+      grid.innerHTML = "";
+      var entries = byCategory[category] || [];
+      entries.forEach(function (entry) {
+        var tile = document.createElement("div");
+        tile.className = "template-tile";
+        tile.setAttribute("data-template-id", entry.id);
+        tile.setAttribute("title", entry.name);
+        if (entry.id === hidden.value) {
+          tile.classList.add("selected");
+        }
+
+        var img = document.createElement("img");
+        img.alt = entry.name;
+        img.loading = "lazy";
+        img.src = "/api/qr/templates/" + encodeURIComponent(entry.id) + "/preview";
+        tile.appendChild(img);
+
+        var label = document.createElement("div");
+        label.className = "template-tile-label";
+        label.textContent = entry.name;
+        tile.appendChild(label);
+
+        tile.addEventListener("click", function () {
+          if (hidden.value === entry.id) return;
+          hidden.value = entry.id;
+          var prev = grid.querySelector(".template-tile.selected");
+          if (prev) prev.classList.remove("selected");
+          tile.classList.add("selected");
+          if (typeof onTemplateChange === "function") {
+            onTemplateChange();
+          }
+        });
+
+        grid.appendChild(tile);
+      });
+    }
+
+    select.addEventListener("change", function () {
+      renderGrid(select.value);
+    });
+
+    if (logoInput && typeof onTemplateChange === "function") {
+      logoInput.addEventListener("change", function () {
+        onTemplateChange();
+      });
+    }
+
+    if (clearBtn && logoInput) {
+      clearBtn.addEventListener("click", function () {
+        if (!logoInput.value) return;
+        logoInput.value = "";
+        if (typeof onTemplateChange === "function") {
+          onTemplateChange();
+        }
+      });
+    }
+
+    return {
+      load: function (templates) {
+        byCategory = {};
+        templates.forEach(function (entry) {
+          if (!byCategory[entry.category]) {
+            byCategory[entry.category] = [];
+          }
+          byCategory[entry.category].push(entry);
+        });
+        orderedCategories = Object.keys(byCategory).sort(compareCategories);
+
+        select.innerHTML = "";
+        orderedCategories.forEach(function (cat) {
+          var opt = document.createElement("option");
+          opt.value = cat;
+          opt.textContent = cat.charAt(0).toUpperCase() + cat.slice(1);
+          select.appendChild(opt);
+        });
+
+        var initial = orderedCategories.indexOf("default") !== -1
+          ? "default"
+          : orderedCategories[0];
+        select.value = initial;
+        renderGrid(initial);
+      },
+    };
+  }
+
+  // The Single QR form has a live preview, so selecting a template (or
+  // changing the logo) re-triggers the existing submit handler. The
+  // Batch form is fire-and-forget: the chosen template id and the logo
+  // file are simply included in the submitted FormData.
+  var singleDesign = setupDesignSection("single", function () {
+    var form = document.getElementById("single-form");
+    if (!form) return;
+    var dataInput = form.elements["data"];
+    if (!dataInput || !dataInput.value) return;
+    if (typeof form.requestSubmit === "function") {
+      form.requestSubmit();
+    } else {
+      form.dispatchEvent(new Event("submit", { cancelable: true, bubbles: true }));
+    }
+  });
+  var batchDesign = setupDesignSection("batch", null);
+
+  fetch("/api/qr/templates")
+    .then(function (response) {
+      if (!response.ok) throw new Error("templates fetch failed");
+      return response.json();
+    })
+    .then(function (body) {
+      var templates = (body && body.templates) || [];
+      if (singleDesign) singleDesign.load(templates);
+      if (batchDesign) batchDesign.load(templates);
+    })
+    .catch(function () {
+      // Templates unavailable (offline / server error). The Design
+      // section remains empty but the form still submits with the
+      // default template, so the page keeps working.
+    });
+
   // ---- Single QR ---------------------------------------------------
   var singleForm = document.getElementById("single-form");
   var singlePreview = document.getElementById("single-preview");
@@ -204,13 +375,20 @@
       var mode = getMode();
       // Build a clean FormData that contains only the active range field.
       var formData = new FormData();
-      var pass = ["start", "padding", "prefix", "data_template", "label_template", "box_size", "border", "format"];
+      var pass = ["start", "padding", "prefix", "data_template", "label_template", "box_size", "border", "format", "template_id"];
       pass.forEach(function (name) {
         var el = batchForm.elements[name];
         if (el && el.value !== undefined && el.value !== null) {
           formData.set(name, el.value);
         }
       });
+      // Include the logo file separately (FormData.set on a file input
+      // copies only the .value string, which is empty / fake-pathed for
+      // security reasons; .files[0] is the real File object).
+      var batchLogoInput = document.getElementById("batch-logo");
+      if (batchLogoInput && batchLogoInput.files && batchLogoInput.files.length > 0) {
+        formData.set("logo", batchLogoInput.files[0]);
+      }
       if (mode === "count") {
         formData.set("count", batchForm.elements["count"].value);
       } else {

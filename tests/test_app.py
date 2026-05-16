@@ -698,3 +698,293 @@ def test_batch_stream_mid_stream_error_event(client) -> None:
     assert "could not be encoded" in terminal["error"]
     # No ``result`` event was emitted.
     assert all(evt.get("event") != "result" for evt in events)
+
+
+# --- Custom QR designs (FEAT-002) -----------------------------------
+#
+# These tests cover the new template_id form field, the optional logo
+# upload, the GET /api/qr/templates listing, and the per-template PNG
+# preview endpoint. They use real PIL pixel inspection rather than
+# mocking the rendering pipeline so a regression that silently dropped
+# the logo or the template wiring would surface as a colour mismatch.
+
+REQUIRED_SPORT_CATEGORIES = {
+    "marathon",
+    "running",
+    "duathlon",
+    "triathlon",
+    "cycling",
+    "swimming",
+}
+
+
+def _orange_logo_bytes(size: tuple[int, int] = (64, 64)) -> bytes:
+    """Build a small solid-orange PNG suitable for embedding in a QR."""
+    from PIL import Image as _Image
+
+    img = _Image.new("RGB", size, (255, 165, 0))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _is_orangeish(pixel) -> bool:
+    """Return True if a pixel is "in the orange ballpark".
+
+    The pad helper paints the logo onto a white rounded square and the
+    QR encoder may anti-alias the perimeter, so we widen the tolerance
+    rather than asserting exact (255, 165, 0).
+    """
+    if isinstance(pixel, int):
+        return False  # mode "L" / "1" image - never orange enough
+    r, g, b = pixel[:3]
+    return r >= 200 and 100 <= g <= 200 and b <= 80
+
+
+def _centre_pixel(png_bytes: bytes):
+    from PIL import Image as _Image
+
+    img = _Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    cx = img.width // 2
+    cy = img.height // 2
+    return img.getpixel((cx, cy))
+
+
+def test_get_templates_listing_has_required_categories(client) -> None:
+    rv = client.get("/api/qr/templates")
+    assert rv.status_code == 200
+    assert rv.mimetype == "application/json"
+    body = rv.get_json()
+    assert body is not None
+    assert isinstance(body.get("templates"), list)
+    templates = body["templates"]
+    assert len(templates) >= 30
+    # Every entry has the required keys.
+    for entry in templates:
+        for key in ("id", "name", "category", "spec"):
+            assert key in entry, f"missing {key} in {entry}"
+    categories = {entry["category"] for entry in templates}
+    # All six required sport categories are present.
+    assert REQUIRED_SPORT_CATEGORIES.issubset(categories), categories
+    # Each required sport category has at least 3 entries.
+    for cat in REQUIRED_SPORT_CATEGORIES:
+        in_cat = [e for e in templates if e["category"] == cat]
+        assert len(in_cat) >= 3, f"{cat} has {len(in_cat)} entries, want >= 3"
+
+
+def test_get_template_preview_returns_png(client) -> None:
+    rv = client.get("/api/qr/templates/default/preview")
+    assert rv.status_code == 200
+    assert rv.mimetype == "image/png"
+    assert rv.data.startswith(PNG_MAGIC)
+
+
+def test_get_template_preview_unknown_returns_404(client) -> None:
+    rv = client.get("/api/qr/templates/does-not-exist/preview")
+    assert rv.status_code == 404
+    assert rv.mimetype == "application/json"
+    body = rv.get_json()
+    assert body is not None and "error" in body
+
+
+def test_single_with_template_id_differs_from_default(client) -> None:
+    """A coloured template must produce different bytes than the default."""
+    rv_default = client.post("/api/qr/single", data={"data": "hello"})
+    rv_styled = client.post(
+        "/api/qr/single",
+        data={"data": "hello", "template_id": "running-track"},
+    )
+    assert rv_default.status_code == 200
+    assert rv_styled.status_code == 200
+    assert rv_default.data.startswith(PNG_MAGIC)
+    assert rv_styled.data.startswith(PNG_MAGIC)
+    assert rv_default.data != rv_styled.data
+
+
+def test_single_with_template_id_default_is_byte_identical(client) -> None:
+    """``template_id=default`` must hit the legacy fast path byte-for-byte."""
+    rv_a = client.post("/api/qr/single", data={"data": "hello"})
+    rv_b = client.post(
+        "/api/qr/single",
+        data={"data": "hello", "template_id": "default"},
+    )
+    assert rv_a.status_code == 200
+    assert rv_b.status_code == 200
+    assert rv_a.data == rv_b.data
+
+
+def test_single_unknown_template_id_returns_400(client) -> None:
+    rv = client.post(
+        "/api/qr/single",
+        data={"data": "hello", "template_id": "no-such-template"},
+    )
+    assert rv.status_code == 400
+    body = rv.get_json()
+    assert body is not None and "error" in body
+    assert "unknown template_id" in body["error"]
+
+
+def test_single_with_logo_returns_png(client) -> None:
+    """A small orange logo must end up embedded at the centre of the QR."""
+    logo_bytes = _orange_logo_bytes()
+    rv = client.post(
+        "/api/qr/single",
+        data={
+            "data": "hello",
+            "logo": (io.BytesIO(logo_bytes), "logo.png", "image/png"),
+        },
+        content_type="multipart/form-data",
+    )
+    assert rv.status_code == 200, rv.data
+    assert rv.mimetype == "image/png"
+    assert rv.data.startswith(PNG_MAGIC)
+    pixel = _centre_pixel(rv.data)
+    assert _is_orangeish(pixel), f"centre pixel {pixel!r} is not orange-ish"
+
+
+def test_single_logo_too_large_returns_400(client) -> None:
+    """A logo above MAX_LOGO_BYTES must be rejected before decoding."""
+    from qr_generator import MAX_LOGO_BYTES as _MAX
+
+    # Build a >MAX_LOGO_BYTES JPEG by encoding random RGB noise so it
+    # cannot be compressed back below the cap. JPEG is a fine choice
+    # here because PNG would compress a noise-free buffer aggressively.
+    import os as _os
+
+    noise = _os.urandom(_MAX + 1024)
+    rv = client.post(
+        "/api/qr/single",
+        data={
+            "data": "hello",
+            "logo": (io.BytesIO(noise), "logo.jpg", "image/jpeg"),
+        },
+        content_type="multipart/form-data",
+    )
+    assert rv.status_code == 400
+    body = rv.get_json()
+    assert body is not None and "error" in body
+    assert "too large" in body["error"]
+
+
+def test_single_logo_wrong_mime_returns_400(client) -> None:
+    """A non-image upload must be rejected with a clean 400."""
+    rv = client.post(
+        "/api/qr/single",
+        data={
+            "data": "hello",
+            "logo": (io.BytesIO(b"hello, world\n"), "note.txt", "text/plain"),
+        },
+        content_type="multipart/form-data",
+    )
+    assert rv.status_code == 400
+    body = rv.get_json()
+    assert body is not None and "error" in body
+    msg = body["error"].lower()
+    assert ("png" in msg and "jpeg" in msg) or "could not be decoded" in msg
+
+
+def test_single_logo_overlarge_dimensions_returns_400(client) -> None:
+    """A PNG bigger than MAX_LOGO_DIMENSION on either axis must be rejected."""
+    from PIL import Image as _Image
+    from qr_generator import MAX_LOGO_DIMENSION as _MAX_DIM
+
+    big = _Image.new("RGB", (_MAX_DIM + 1, _MAX_DIM + 1), (200, 200, 200))
+    buf = io.BytesIO()
+    big.save(buf, format="PNG")
+    buf.seek(0)
+    rv = client.post(
+        "/api/qr/single",
+        data={
+            "data": "hello",
+            "logo": (buf, "big.png", "image/png"),
+        },
+        content_type="multipart/form-data",
+    )
+    assert rv.status_code == 400
+    body = rv.get_json()
+    assert body is not None and "error" in body
+    assert "dimension" in body["error"].lower()
+
+
+def test_single_logo_plus_oversized_payload_returns_400(client) -> None:
+    """An H-mode capacity overflow with a logo must surface as a 400."""
+    rv = client.post(
+        "/api/qr/single",
+        data={
+            "data": "A" * 2000,
+            "logo": (io.BytesIO(_orange_logo_bytes()), "logo.png", "image/png"),
+        },
+        content_type="multipart/form-data",
+    )
+    assert rv.status_code == 400
+    body = rv.get_json()
+    assert body is not None and "error" in body
+    assert "could not be encoded" in body["error"]
+
+
+def test_batch_with_logo_each_entry_contains_logo_region(client) -> None:
+    """Every QR in a batch must embed the logo, not just the first."""
+    logo_bytes = _orange_logo_bytes()
+    rv = client.post(
+        "/api/qr/batch",
+        data={
+            "start": "1",
+            "count": "2",
+            "format": "zip",
+            "logo": (io.BytesIO(logo_bytes), "logo.png", "image/png"),
+        },
+        content_type="multipart/form-data",
+    )
+    assert rv.status_code == 200, rv.data
+    assert rv.mimetype == "application/zip"
+    with zipfile.ZipFile(io.BytesIO(rv.data)) as zf:
+        names = zf.namelist()
+        assert names == ["1.png", "2.png"]
+        for name in names:
+            png = zf.read(name)
+            assert png.startswith(PNG_MAGIC)
+            pixel = _centre_pixel(png)
+            assert _is_orangeish(pixel), (
+                f"entry {name} centre pixel {pixel!r} is not orange-ish"
+            )
+
+
+def test_batch_stream_with_template_emits_styled_payload(client) -> None:
+    """The streaming path must apply the template per-item, not just at the
+    edges. We compare the terminal ZIP entries against a no-template stream
+    and assert the bytes differ for every entry."""
+    import base64 as _b64
+
+    def _terminal_zip_entries(form_data: dict) -> dict[str, bytes]:
+        # Use a fresh client per request: the streaming endpoint relies
+        # on ``stream_with_context``, which keeps the request context
+        # alive until the response body is fully consumed. Holding two
+        # such responses concurrently in one client trips Flask's
+        # request-context bookkeeping in the test layer.
+        with flask_app.test_client() as c:
+            rv = c.post("/api/qr/batch/stream", data=form_data)
+            assert rv.status_code == 200
+            body = rv.get_data()
+        events = _parse_ndjson(body)
+        result = events[-1]
+        assert result["event"] == "result"
+        payload = _b64.b64decode(result["data_base64"])
+        with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+            return {name: zf.read(name) for name in zf.namelist()}
+
+    plain = _terminal_zip_entries(
+        {"start": "1", "count": "2", "format": "zip"}
+    )
+    styled = _terminal_zip_entries(
+        {
+            "start": "1",
+            "count": "2",
+            "format": "zip",
+            "template_id": "running-track",
+        }
+    )
+    assert set(plain.keys()) == set(styled.keys()) == {"1.png", "2.png"}
+    for name in plain:
+        assert plain[name] != styled[name], (
+            f"entry {name} did not get styled in the streaming path"
+        )

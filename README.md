@@ -196,6 +196,86 @@ curl -N -s -X POST \
 # {"event": "result", "filename": "qr_batch_1_3.zip", ...}
 ```
 
+### Custom QR designs
+
+`POST /api/qr/single`, `POST /api/qr/batch`, and `POST /api/qr/batch/stream`
+all accept two optional fields that style the rendered QR codes:
+
+- `template_id` (default `default`): the slug of a built-in design
+  template. The literal value `default` (or an empty / missing field)
+  takes the legacy plain-black-on-white render path byte-for-byte. Any
+  other id is validated against the template registry; an unknown id
+  returns HTTP 400 with `{"error": "unknown template_id: ..."}`. Browse
+  the available ids via `GET /api/qr/templates` (see below).
+- `logo` (file field, optional): a PNG or JPEG image embedded at the
+  centre of every QR. The HTTP layer enforces three validation limits
+  before the bytes ever reach the encoder; failures all return a clean
+  HTTP 400 with a JSON `error` body, never a 500:
+  - byte cap: `MAX_LOGO_BYTES = 2 * 1024 * 1024` (2 MB)
+  - dimension cap: `MAX_LOGO_DIMENSION = 1024` on each axis
+  - format cap: only PNG and JPEG are accepted (mime sniffing via
+    PIL `Image.verify` plus `Image.format`, so a renamed `.txt`
+    pretending to be `image/png` is caught)
+
+When a logo is supplied, the encoder is bumped to error-correction
+level H (15-30% recovery, vs M's 15%) so the QR stays scannable with
+the centre region partially obscured. The trade-off is that QR version
+40's binary capacity at H is only roughly 1273 bytes versus M's roughly
+2300 bytes, so a payload that fits without a logo may overflow with
+one. Capacity overflow surfaces the same way as any other encoder
+failure: a clean 400 with `{"error": "data could not be encoded: ..."}`
+on the synchronous endpoints, and a terminal `{"event": "error", ...}`
+NDJSON line on `POST /api/qr/batch/stream`.
+
+#### `GET /api/qr/templates`
+
+Returns the JSON listing of built-in design templates as
+`{"templates": [<entry>, ...]}` where each entry has `id`, `name`,
+`category`, and `spec` keys. The response carries
+`Cache-Control: public, max-age=300` so warm browsers skip the round
+trip on subsequent page loads inside the cache window.
+
+```bash
+curl -fsS http://127.0.0.1:5000/api/qr/templates | python -m json.tool | head
+# {
+#     "templates": [
+#         {"id": "default", "name": "Default (plain black & white)", ...},
+#         ...
+#     ]
+# }
+```
+
+The registry currently spans the categories `default`, `marathon`,
+`running`, `duathlon`, `triathlon`, `cycling`, `swimming`, `business`,
+`event`, `wifi`, `social`, and `personal`, with at least three
+templates per non-default category.
+
+#### `GET /api/qr/templates/<template_id>/preview`
+
+Returns a small `image/png` thumbnail of `template_id` rendered with a
+fixed short payload. The response carries
+`Cache-Control: public, max-age=3600` and the rendered bytes are
+cached in a per-process module-level dict, so a warm Lambda renders
+each preview at most once. An unknown id returns
+`{"error": "unknown template id"}` with HTTP 404.
+
+```bash
+curl -fsS http://127.0.0.1:5000/api/qr/templates/marathon-fire/preview \
+  -o preview.png
+file preview.png   # PNG image data ...
+```
+
+> **Deployment notes:** the preview cache is per-warm-instance, so a
+> cold start on Vercel re-renders the gallery on first request and
+> shares it across subsequent requests in the same instance. The cache
+> is intentionally unbounded but every entry is a small thumbnail PNG
+> (a few KB each) and the registry size is bounded by the `TEMPLATES`
+> list, so the steady-state memory footprint is small. The logo bytes
+> traverse `POST /api/qr/batch/stream` per request and the existing
+> base64-inflation note above still applies to the terminal `result`
+> event when a logo plus many entries push the packed ZIP/PDF closer
+> to the per-response body cap.
+
 ### Error handling
 
 Bad input (missing `start`, `count <= 0`, `end < start`, both `count`
