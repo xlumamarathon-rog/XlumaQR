@@ -37,13 +37,16 @@ Form fields:
 
 The on-screen preview is rendered at the `box_size` you typed (default
 10, fast). The **Download HD PNG** button re-renders at `box_size = 40`
-before downloading so the saved file is high-resolution (~1640 px per
-side at the default border for a typical URL payload, e.g. the form's
-`https://example.com/123` placeholder, which encodes to a 33-module QR;
-shorter payloads encode a smaller QR version and so produce a smaller
-HD PNG, e.g. ~1320 px for a few-character payload), regardless of the
-preview's `box_size`. To download at any other `box_size`, set the
-form field directly: the preview will then match the download.
+before downloading so the saved file is high-resolution (roughly
+1640 px per side at the default border for a payload that encodes to
+a 33-module QR, e.g. a typical URL of about 25 to 35 characters at
+error-correction H, which is the level used whenever a logo or label
+is supplied). Shorter payloads encode a smaller QR version and so
+produce a smaller HD PNG, e.g. ~1160 px for a few-character payload
+and ~1320 px for a short URL. Either way the download is far larger
+than the preview's ~330 px at the default `box_size = 10`. To
+download at any other `box_size`, set the form field directly: the
+preview will then match the download.
 
 ## Sequential Batch
 

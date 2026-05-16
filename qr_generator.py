@@ -790,7 +790,7 @@ def _label_color_from_spec(spec: dict) -> tuple[int, int, int]:
     raise ValueError(f"unknown color_mask_kind: {kind!r}")
 
 
-@functools.lru_cache(maxsize=64)
+@functools.lru_cache(maxsize=128)
 def _load_label_font(size_px: int):
     """Return the bundled Plus Jakarta Sans Bold TTF at ``size_px``.
 
@@ -802,10 +802,13 @@ def _load_label_font(size_px: int):
     Cached by ``size_px`` because :data:`LABEL_FONT_PATH` is module-
     constant. The centre-badge autofit loop in
     :func:`_render_label_badge` walks a range of font sizes (4 px
-    steps from ~30% of ``LOGO_WORK_SIZE`` down to a 24 px floor); on
-    a long label that case can be ~70 iterations, and re-parsing the
-    TTF on every step adds up. ``maxsize=64`` covers the entire
-    autofit range plus typical band-below sizes with room to spare.
+    steps from ~30% of ``LOGO_WORK_SIZE`` down to a 24 px floor); at
+    ``LOGO_WORK_SIZE = 1024`` the worst case is exactly 72 distinct
+    sizes (307, 303, ..., 27, 24) for a long label that needs the
+    floor. ``maxsize=128`` covers the entire autofit range plus the
+    band-below font sizes with headroom, so a re-render of the same
+    label hits the cache on every step instead of evicting the
+    largest sizes between renders.
     """
     try:
         return ImageFont.truetype(LABEL_FONT_PATH, size_px)
