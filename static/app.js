@@ -253,6 +253,42 @@
       maybeFireInitialBatchPreview();
     });
 
+  // ---- Shared helpers ---------------------------------------------
+  //
+  // ``triggerDownload`` is used by the Batch submit handler (for the
+  // generated ZIP / PDF) and by the per-preview "Download PNG" buttons
+  // attached beneath the live preview images on both tabs. It mints a
+  // throwaway object URL, programmatically clicks an invisible <a>,
+  // then revokes the URL on a short timer so the browser has time to
+  // start the download before the URL is invalidated.
+  function triggerDownload(blob, filename) {
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () {
+      URL.revokeObjectURL(url);
+    }, 1000);
+  }
+
+  // Append a "Download PNG" button to a preview pane. Both render
+  // paths replace ``previewEl.innerHTML`` whenever they redraw or
+  // reset to the empty state, so the button is naturally cleared
+  // alongside the image when no QR is showing.
+  function appendPreviewDownloadButton(previewEl, blob, filename) {
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "primary preview-download";
+    btn.textContent = "Download PNG";
+    btn.addEventListener("click", function () {
+      triggerDownload(blob, filename);
+    });
+    previewEl.appendChild(btn);
+  }
+
   // ---- Single QR ---------------------------------------------------
   var singleForm = document.getElementById("single-form");
   var singlePreview = document.getElementById("single-preview");
@@ -290,6 +326,11 @@
           img.alt = "Generated QR code";
           img.src = lastBlobUrl;
           singlePreview.appendChild(img);
+          // The form's ``data`` value is user-supplied and may contain
+          // characters that are unsafe for filenames (slashes, NUL,
+          // path traversal, etc.), so we use a fixed sensible default
+          // rather than trying to sanitise it here.
+          appendPreviewDownloadButton(singlePreview, blob, "qr.png");
         })
         .catch(function (err) {
           singleError.textContent = err.message;
@@ -471,6 +512,14 @@
         img.alt = "Batch sample QR preview";
         img.src = batchPreviewBlobUrl;
         batchPreview.appendChild(img);
+        // ``paddedFirst`` is the zero-padded first range value (e.g.
+        // "0101"), matching what generate_sequence would emit on the
+        // server. It only contains digits, so it is filename-safe.
+        appendPreviewDownloadButton(
+          batchPreview,
+          blob,
+          "qr_" + paddedFirst + ".png"
+        );
       })
       .catch(function (err) {
         if (err && err.name === "AbortError") {
@@ -664,19 +713,6 @@
           out[i] = bin.charCodeAt(i);
         }
         return out;
-      }
-
-      function triggerDownload(blob, filename) {
-        var url = URL.createObjectURL(blob);
-        var a = document.createElement("a");
-        a.href = url;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        setTimeout(function () {
-          URL.revokeObjectURL(url);
-        }, 1000);
       }
 
       function finish() {
