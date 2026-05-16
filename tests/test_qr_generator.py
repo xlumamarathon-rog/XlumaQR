@@ -954,12 +954,14 @@ def test_label_centre_badge_long_label_at_floor_still_legible_and_white_padded()
     """Auto-fit hits the 24 px font floor with a label long enough
     that even at the floor the rendered text is wider than the inner
     pad, so ``_pad_logo``'s ``thumbnail`` step downscales the scratch
-    image. Pin two things at the floor: (a) the bare QR's size is
+    image. Pin three things at the floor: (a) the bare QR's size is
     preserved (the centre-badge dispatch is taken, not the band-below
-    layout), and (b) the white rounded pad is still present behind
-    the glyph so the QR remains scannable. Without this regression
-    the floor / inner-pad ratio could quietly drift and silently
-    degrade legibility for long-label callers."""
+    layout), (b) the white rounded pad is still present behind the
+    glyph so the QR remains scannable, and (c) the glyph itself
+    survives the LANCZOS downscale so the label is actually
+    legible (not just a blank white pad). Without (c) a regression
+    that produced an empty rounded white square would silently pass
+    the white-pad assertion alone."""
     long_label = "ABCDEFGHIJKLMNOP" * 2  # 32 chars
     bare = generate_qr("hello")
     labelled = generate_qr("hello", label=long_label).convert("RGB")
@@ -972,16 +974,34 @@ def test_label_centre_badge_long_label_at_floor_still_legible_and_white_padded()
     # The pad is mostly white (the glyph occupies a small fraction of
     # the badge area even when downscaled). Require a generous count
     # of pure-white pixels inside the centre region so a regression
-    # that lost the white pad would fail loudly.
+    # that lost the white pad would fail loudly. The symmetric
+    # assertion below pins the glyph itself: a minimum count of
+    # non-white pixels inside the same region, so a regression that
+    # turned the badge into a blank rounded-white square (e.g. the
+    # downscale destroying the glyph entirely) would fail too.
+    # Empirical observation in this fixture: ~3 567 white and ~277
+    # non-white (anti-aliased glyph halo) pixels in a 3 844-pixel
+    # sample; the floors below leave comfortable margin.
     white = 0
+    nonwhite = 0
     for y in range(cy - half, cy + half):
         for x in range(cx - half, cx + half):
-            if labelled.getpixel((x, y)) == (255, 255, 255):
+            pixel = labelled.getpixel((x, y))
+            if pixel == (255, 255, 255):
                 white += 1
+            else:
+                nonwhite += 1
+    sample = (2 * half) * (2 * half)
     assert white >= 200, (
         f"expected the white rounded pad to dominate the centre region "
         f"even at the 24 px font floor; got {white} white pixels in a "
-        f"{(2 * half) * (2 * half)}-pixel sample"
+        f"{sample}-pixel sample"
+    )
+    assert nonwhite >= 30, (
+        f"expected the glyph to survive the LANCZOS downscale at the "
+        f"24 px font floor (non-white pixels carry the rendered text); "
+        f"got only {nonwhite} non-white pixels in a {sample}-pixel "
+        f"sample, suggesting the badge degraded into a blank white pad"
     )
 
 
