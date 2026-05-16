@@ -81,32 +81,32 @@ def generate_qr(
     border: int = 4,
     label_height: int | None = None,
 ) -> Image.Image:
-    """Render ``data`` as a QR code and optionally paste a printed label below.
+    """Render ``data`` as a QR code and optionally overlay a label on it.
 
     The QR is built with :data:`qrcode.constants.ERROR_CORRECT_M`. When
-    ``label`` is provided, a new white canvas is created that is at least as
-    wide as the QR and tall enough to fit the QR plus the label band; the
-    label is drawn centered in black using Pillow's default bitmap font
-    (no external font file required).
+    ``label`` is provided, a small white badge is drawn at the bottom
+    center of the QR image and the label text is rendered on top of it.
+    The QR remains scannable because error correction level M tolerates
+    up to 15% damage.
 
     Parameters
     ----------
     data:
         Payload encoded into the QR code.
     label:
-        Optional text printed under the QR. ``None`` returns the bare QR.
+        Optional text overlaid on the QR. ``None`` returns the bare QR.
     box_size:
         Pixel size of each QR module (passed through to ``qrcode``).
     border:
         Quiet-zone width in modules (passed through to ``qrcode``).
     label_height:
-        Height in pixels of the label band. When ``None`` (the default),
+        Height in pixels of the overlay badge. When ``None`` (the default),
         a value proportional to the QR size is chosen.
 
     Returns
     -------
     PIL.Image.Image
-        RGB image of the rendered QR (with label, if provided).
+        RGB image of the rendered QR (with label overlay, if provided).
     """
     qr = qrcode.QRCode(
         error_correction=ERROR_CORRECT_M,
@@ -128,32 +128,44 @@ def generate_qr(
 
     font = ImageFont.load_default()
 
-    # Measure the label so we can center it horizontally and (if needed)
-    # widen the canvas so the text is not clipped.
-    measure = ImageDraw.Draw(qr_img)
+    # Measure the label text.
+    draw = ImageDraw.Draw(qr_img)
     try:
-        bbox = measure.textbbox((0, 0), label, font=font)
+        bbox = draw.textbbox((0, 0), label, font=font)
         text_w = bbox[2] - bbox[0]
         text_h = bbox[3] - bbox[1]
         text_offset_x = -bbox[0]
         text_offset_y = -bbox[1]
     except AttributeError:
         # Pillow < 9.2 fallback (kept for safety; modern Pillow has textbbox).
-        text_w, text_h = measure.textsize(label, font=font)  # type: ignore[attr-defined]
+        text_w, text_h = draw.textsize(label, font=font)  # type: ignore[attr-defined]
         text_offset_x = 0
         text_offset_y = 0
 
-    canvas_w = max(qr_w, text_w + 2 * border * box_size)
-    canvas_h = qr_h + label_height
-    canvas = Image.new("RGB", (canvas_w, canvas_h), "white")
-    canvas.paste(qr_img, ((canvas_w - qr_w) // 2, 0))
+    # Draw a white badge at the bottom center of the QR, overlaid on the
+    # QR pattern. Add horizontal and vertical padding around the text.
+    pad_x = max(4, box_size)
+    pad_y = max(2, box_size // 2)
+    badge_w = text_w + 2 * pad_x
+    badge_h = text_h + 2 * pad_y
 
-    draw = ImageDraw.Draw(canvas)
-    text_x = (canvas_w - text_w) // 2 + text_offset_x
-    text_y = qr_h + (label_height - text_h) // 2 + text_offset_y
+    badge_x = (qr_w - badge_w) // 2
+    badge_y = qr_h - badge_h - (border * box_size) // 2
+
+    # Draw badge background (white rectangle)
+    draw.rectangle(
+        [badge_x, badge_y, badge_x + badge_w, badge_y + badge_h],
+        fill="white",
+        outline="black",
+        width=1,
+    )
+
+    # Draw label text centered in the badge
+    text_x = badge_x + pad_x + text_offset_x
+    text_y = badge_y + pad_y + text_offset_y
     draw.text((text_x, text_y), label, fill="black", font=font)
 
-    return canvas
+    return qr_img
 
 
 def compute_range(

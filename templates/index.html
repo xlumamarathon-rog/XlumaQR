@@ -161,55 +161,62 @@
           </div>
 
           <div class="row">
-            <label for="batch-prefix">Filename prefix</label>
-            <input
-              type="text"
-              id="batch-prefix"
-              name="prefix"
-              placeholder="(optional, e.g. qr_)"
-            />
+            <button type="button" id="batch-advanced-toggle" class="advanced-toggle">
+              <span class="advanced-arrow">&#9654;</span> Advanced settings
+            </button>
           </div>
-          <div class="row two-col">
-            <div>
-              <label for="batch-data-template">Data template</label>
+          <div id="batch-advanced" class="advanced-section" hidden>
+            <div class="row">
+              <label for="batch-prefix">Filename prefix</label>
               <input
                 type="text"
-                id="batch-data-template"
-                name="data_template"
-                value="{n}"
+                id="batch-prefix"
+                name="prefix"
+                placeholder="(optional, e.g. qr_)"
               />
             </div>
-            <div>
-              <label for="batch-label-template">Label template</label>
-              <input
-                type="text"
-                id="batch-label-template"
-                name="label_template"
-                value="{n}"
-                placeholder="empty = no label"
-              />
+            <div class="row two-col">
+              <div>
+                <label for="batch-data-template">Data template</label>
+                <input
+                  type="text"
+                  id="batch-data-template"
+                  name="data_template"
+                  value="{n}"
+                />
+              </div>
+              <div>
+                <label for="batch-label-template">Label template</label>
+                <input
+                  type="text"
+                  id="batch-label-template"
+                  name="label_template"
+                  value="{n}"
+                  placeholder="empty = no label"
+                />
+              </div>
             </div>
-          </div>
-          <div class="row two-col">
-            <div>
-              <label for="batch-box-size">Box size</label>
-              <input
-                type="number"
-                id="batch-box-size"
-                name="box_size"
-                value="10"
-                min="1"
-              />
-            </div>
-            <div>
-              <label for="batch-border">Border</label>
-              <input
-                type="number"
-                id="batch-border"
-                name="border"
-                value="4"
-                min="0"
-              />
+            <div class="row two-col">
+              <div>
+                <label for="batch-box-size">Box size</label>
+                <input
+                  type="number"
+                  id="batch-box-size"
+                  name="box_size"
+                  value="10"
+                  min="1"
+                />
+              </div>
+              <div>
+                <label for="batch-border">Border</label>
+                <input
+                  type="number"
+                  id="batch-border"
+                  name="border"
+                  value="4"
+                  min="0"
+                />
+              </div>
             </div>
           </div>
 
@@ -235,6 +242,12 @@
             <button type="submit" class="primary">Generate &amp; download</button>
           </div>
           <div id="batch-error" class="error" hidden></div>
+          <div id="batch-progress" class="progress-section" hidden>
+            <div class="progress-bar-container">
+              <div class="progress-bar-fill"></div>
+            </div>
+            <p class="progress-text">Generating QR codes...</p>
+          </div>
         </form>
       </section>
     </main>

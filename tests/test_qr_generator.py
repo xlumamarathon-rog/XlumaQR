@@ -37,10 +37,10 @@ def test_generate_qr_with_label_increases_height_and_image_is_decodable_as_png_b
     bare = generate_qr("hello", box_size=10, border=4)
     labeled = generate_qr("hello", label="42", box_size=10, border=4)
 
-    # Label band must add vertical pixels.
-    assert labeled.size[1] > bare.size[1]
-    # And the labeled canvas must be at least as wide as the bare QR.
-    assert labeled.size[0] >= bare.size[0]
+    # Label is now overlaid, so size stays the same.
+    assert labeled.size == bare.size
+    # The pixels must differ (the overlay badge is drawn on top of the QR).
+    assert labeled.tobytes() != bare.tobytes()
 
     # Round-trip via PNG bytes to confirm the image is a real PNG.
     buf = io.BytesIO()
@@ -186,6 +186,8 @@ def test_generate_sequence_label_template_with_unknown_placeholder_is_literal() 
     assert len(items) == 1
     name, image = items[0]
     assert name == "1.png"
-    # The labelled image must be taller than a bare QR (label band added).
+    # The labelled image has the same size as bare (overlay, not extension)
+    # but the pixel content must differ (proving the label badge was drawn).
     bare = generate_qr("1")
-    assert image.size[1] > bare.size[1]
+    assert image.size == bare.size
+    assert image.tobytes() != bare.tobytes()

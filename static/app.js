@@ -79,8 +79,27 @@
   var batchForm = document.getElementById("batch-form");
   var batchHint = document.getElementById("batch-hint");
   var batchError = document.getElementById("batch-error");
+  var batchProgress = document.getElementById("batch-progress");
+  var batchProgressText = batchProgress ? batchProgress.querySelector(".progress-text") : null;
   var countRow = document.getElementById("batch-count-row");
   var endRow = document.getElementById("batch-end-row");
+
+  // Advanced settings toggle
+  var advancedToggle = document.getElementById("batch-advanced-toggle");
+  var advancedSection = document.getElementById("batch-advanced");
+  if (advancedToggle && advancedSection) {
+    advancedToggle.addEventListener("click", function () {
+      var isHidden = advancedSection.hasAttribute("hidden");
+      var arrow = advancedToggle.querySelector(".advanced-arrow");
+      if (isHidden) {
+        advancedSection.removeAttribute("hidden");
+        if (arrow) arrow.classList.add("open");
+      } else {
+        advancedSection.setAttribute("hidden", "");
+        if (arrow) arrow.classList.remove("open");
+      }
+    });
+  }
 
   function getMode() {
     var radios = batchForm.querySelectorAll('input[name="mode"]');
@@ -199,6 +218,26 @@
       var formatEl = batchForm.querySelector('input[name="format"]:checked');
       var fmt = formatEl ? formatEl.value : "zip";
 
+      // Show progress indicator
+      var codeCount = 0;
+      if (mode === "count") {
+        codeCount = parseInt(batchForm.elements["count"].value || "0", 10);
+      } else {
+        var s = parseInt(batchForm.elements["start"].value || "0", 10);
+        var e = parseInt(batchForm.elements["end"].value || "0", 10);
+        codeCount = Math.max(0, e - s + 1);
+      }
+      if (batchProgress) {
+        batchProgress.removeAttribute("hidden");
+        if (batchProgressText) {
+          batchProgressText.textContent = "Generating " + codeCount + " QR code" + (codeCount === 1 ? "" : "s") + "...";
+        }
+      }
+
+      // Disable the submit button during request
+      var submitBtn = batchForm.querySelector('button[type="submit"]');
+      if (submitBtn) submitBtn.disabled = true;
+
       fetch("/api/qr/batch", { method: "POST", body: formData })
         .then(function (response) {
           if (!response.ok) {
@@ -235,6 +274,11 @@
         .catch(function (err) {
           batchError.textContent = err.message;
           batchError.hidden = false;
+        })
+        .finally(function () {
+          // Hide progress and re-enable button
+          if (batchProgress) batchProgress.setAttribute("hidden", "");
+          if (submitBtn) submitBtn.disabled = false;
         });
     });
   }
