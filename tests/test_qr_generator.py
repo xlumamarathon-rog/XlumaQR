@@ -191,3 +191,129 @@ def test_generate_sequence_label_template_with_unknown_placeholder_is_literal() 
     bare = generate_qr("1")
     assert image.size == bare.size
     assert image.tobytes() != bare.tobytes()
+
+
+# --- iter_batch_with_progress (review-v1 follow-ups) ----------------
+
+
+def test_iter_batch_with_progress_zip_yields_progress_then_result() -> None:
+    """The streaming helper yields one ``progress`` tuple per item plus a
+    final ``result`` tuple. The result bytes must be a valid ZIP whose
+    namelist matches the input filenames in order."""
+    from qr_generator import iter_batch_with_progress
+
+    items = list(generate_sequence(start=1, count=3, padding=2, prefix=""))
+    events = list(iter_batch_with_progress(iter(items), "zip"))
+    progress = [e for e in events if e[0] == "progress"]
+    result = [e for e in events if e[0] == "result"]
+
+    assert len(progress) == 3
+    assert [e[1] for e in progress] == [0, 1, 2]
+    assert [e[2] for e in progress] == ["01.png", "02.png", "03.png"]
+    assert len(result) == 1
+    payload = result[0][1]
+    assert payload.startswith(b"PK")
+    with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+        assert zf.namelist() == ["01.png", "02.png", "03.png"]
+
+
+def test_iter_batch_with_progress_pdf_yields_progress_then_result() -> None:
+    """Same shape contract for the PDF format."""
+    from qr_generator import iter_batch_with_progress
+
+    items = list(generate_sequence(start=1, count=2, padding=1, prefix=""))
+    events = list(iter_batch_with_progress(iter(items), "pdf"))
+    progress = [e for e in events if e[0] == "progress"]
+    result = [e for e in events if e[0] == "result"]
+
+    assert [e[1] for e in progress] == [0, 1]
+    assert len(result) == 1
+    assert result[0][1].startswith(b"%PDF-")
+
+
+def test_iter_batch_with_progress_consumes_lazily_one_at_a_time() -> None:
+    """Review v1 issue 1: the helper must pull from ``items`` lazily so
+    only one image is alive at a time, not buffer the whole batch.
+
+    We feed it a counting iterator and assert that after pulling one
+    ``progress`` event, exactly one item has been consumed from the
+    source. If the helper materialised all items up front (e.g. by
+    wrapping ``items`` in ``list(...)`` or via a chain of generators
+    that pre-pumped the source), the counter would jump straight to
+    the total and the test would fail.
+    """
+    from qr_generator import iter_batch_with_progress
+
+    class CountingIter:
+        def __init__(self, source):
+            self._source = iter(source)
+            self.pulled = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            value = next(self._source)
+            self.pulled += 1
+            return value
+
+    items = list(generate_sequence(start=1, count=4, padding=1, prefix=""))
+    counted = CountingIter(items)
+    gen = iter_batch_with_progress(counted, "zip")
+
+    # First progress event should arrive after exactly one item is pulled.
+    evt = next(gen)
+    assert evt[0] == "progress"
+    assert evt[1] == 0
+    assert counted.pulled == 1
+
+    # Second progress event => exactly two items pulled, etc.
+    evt = next(gen)
+    assert evt[0] == "progress"
+    assert evt[1] == 1
+    assert counted.pulled == 2
+
+    evt = next(gen)
+    assert evt[0] == "progress"
+    assert counted.pulled == 3
+
+    evt = next(gen)
+    assert evt[0] == "progress"
+    assert counted.pulled == 4
+
+    # Source is exhausted; the next event is the terminal result.
+    evt = next(gen)
+    assert evt[0] == "result"
+    assert evt[1].startswith(b"PK")
+    with pytest.raises(StopIteration):
+        next(gen)
+
+
+def test_iter_batch_with_progress_invalid_fmt_raises() -> None:
+    """The helper validates ``fmt`` up front."""
+    from qr_generator import iter_batch_with_progress
+
+    with pytest.raises(ValueError):
+        # Force evaluation by pulling one event from the generator.
+        next(iter_batch_with_progress(iter([]), "tar"))
+
+
+def test_iter_batch_with_progress_propagates_encoder_error() -> None:
+    """If the source iterator raises ``ValueError`` mid-stream (the
+    typical shape of a QR-capacity overflow), the helper must propagate
+    it to the caller rather than swallow it. The caller (the streaming
+    HTTP route) is responsible for surfacing it as an ``error`` event."""
+    from qr_generator import iter_batch_with_progress
+
+    def bad_source():
+        yield ("ok.png", generate_qr("hello"))
+        raise ValueError("payload too large")
+
+    gen = iter_batch_with_progress(bad_source(), "zip")
+    # The first event is the progress for the first (good) item.
+    first = next(gen)
+    assert first[0] == "progress"
+    # Pulling again triggers the raise inside the source, which
+    # propagates through the helper.
+    with pytest.raises(ValueError, match="payload too large"):
+        next(gen)

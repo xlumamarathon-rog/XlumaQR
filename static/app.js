@@ -231,6 +231,10 @@
       }
       if (batchProgress) {
         batchProgress.removeAttribute("hidden");
+        // Restore the bar container in case a previous submit ran the
+        // non-streaming fallback path and hid it.
+        var barRestore = batchProgress.querySelector(".progress-bar-container");
+        if (barRestore) barRestore.removeAttribute("hidden");
         if (batchProgressText) {
           batchProgressText.textContent = "Generating " + codeCount + " QR code" + (codeCount === 1 ? "" : "s") + "...";
         }
@@ -295,7 +299,21 @@
           }
 
           if (!response.body || !response.body.getReader) {
-            // Older browsers without streaming - fall back to text() then parse.
+            // Older browsers without streaming - fall back to text() then
+            // parse linearly. We can't show a live percentage in this
+            // mode, so hide the bar and show a generic "Generating..."
+            // message instead of leaving the user staring at a stuck 0%.
+            if (batchProgressFill) batchProgressFill.style.width = "0%";
+            if (batchProgressPercent) batchProgressPercent.textContent = "";
+            if (batchProgress) {
+              // Keep the section visible only as a textual status, hide
+              // the bar container itself.
+              var bar = batchProgress.querySelector(".progress-bar-container");
+              if (bar) bar.setAttribute("hidden", "");
+            }
+            if (batchProgressText) {
+              batchProgressText.textContent = "Generating, please wait...";
+            }
             return response.text().then(function (text) {
               return processStreamText(text);
             });

@@ -156,6 +156,28 @@ line:
 The response also carries `Cache-Control: no-cache` and
 `X-Accel-Buffering: no` to discourage proxy buffering.
 
+> **Deployment caveat:** `X-Accel-Buffering: no` is an nginx-specific
+> hint. Some serverless platforms (notably Vercel's default
+> Lambda-backed Python runtime) buffer the entire response body before
+> sending any bytes to the client; on those platforms the bar will
+> jump from 0% to 100% in a single tick when the whole NDJSON arrives
+> at once at the end. Correctness does not depend on incremental
+> delivery: the final `result` event always lands and the download
+> still triggers, but the live-progress experience is a localhost /
+> properly-streaming-deployment feature, not a guarantee on every
+> hosting target. Vercel-style runtimes that opt into response
+> streaming (Edge runtime / Fluid Compute / response streaming flag)
+> do flush incrementally.
+
+> **Response size limit:** the terminal `result` event embeds the
+> packed ZIP/PDF as base64 inside the JSON line, which inflates the
+> payload by roughly 33%. Some serverless platforms enforce a
+> per-response body cap (Vercel Hobby is currently 4.5 MB) which a
+> large batch can hit well before the `MAX_RANGE_SIZE` limit on the
+> input. If you need very large batches over a hosted streaming
+> endpoint, prefer `POST /api/qr/batch` (binary response, no base64
+> overhead) or run on a deployment without the cap.
+
 The synchronous `POST /api/qr/batch` remains the simpler choice for
 scripted/curl usage where you just want one ZIP/PDF blob in one
 response. Use `/api/qr/batch/stream` when you want a real percentage

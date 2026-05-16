@@ -603,3 +603,98 @@ def test_batch_stream_padded_prefix_filenames(client) -> None:
     payload = _b64.b64decode(result["data_base64"])
     with zipfile.ZipFile(io.BytesIO(payload)) as zf:
         assert zf.namelist() == ["tkt_001.png", "tkt_002.png"]
+
+
+# --- Streaming batch endpoint: review-v1 follow-ups -----------------
+
+
+def test_batch_stream_chunks_arrive_incrementally(client) -> None:
+    """Review v1 issue 3: the response must actually stream.
+
+    A regression that wrapped the generator in ``list(...)`` (e.g. by
+    dropping ``stream_with_context`` or by calling ``rv.get_data()``
+    inside the route) would buffer the entire NDJSON body before any
+    chunks were emitted. We assert here that the response is marked as
+    streamed, that the underlying chunk iterator emits progress chunks
+    *before* the result chunk, and that progress events for distinct
+    items arrive in distinct chunks (not all bundled into one) - which
+    is only possible if the helper yields each progress event as its
+    item is rendered, rather than buffering all N images first.
+    """
+    rv = client.post(
+        "/api/qr/batch/stream",
+        data={"start": "1", "count": "3", "format": "zip"},
+        buffered=False,
+    )
+    assert rv.status_code == 200
+    assert rv.is_streamed
+
+    progress_chunks = 0
+    saw_result = False
+    for chunk in rv.response:
+        if not chunk:
+            continue
+        has_progress = b'"event": "progress"' in chunk
+        has_result = b'"event": "result"' in chunk
+        if has_progress:
+            progress_chunks += 1
+            # If we see progress, we must not yet have seen result, and
+            # the result must not be in the same chunk (which would mean
+            # the body buffered until rendering finished).
+            assert not saw_result, (
+                "result event arrived before progress events, "
+                "which means the body was buffered"
+            )
+            assert not has_result, (
+                "progress and result events arrived in the same chunk, "
+                "which means the body was buffered"
+            )
+        elif has_result:
+            assert progress_chunks > 0, (
+                "result event arrived before any progress events, "
+                "which means the body was buffered"
+            )
+            saw_result = True
+    # All three progress events must arrive in their own chunks; if
+    # they were bundled (e.g. flushed only at the end of rendering),
+    # we'd see fewer chunks here.
+    assert progress_chunks == 3
+    assert saw_result
+
+
+def test_batch_stream_mid_stream_error_event(client) -> None:
+    """Review v1 issue 6: a mid-stream encoder ``ValueError`` must be
+    surfaced as an ``error`` NDJSON event with HTTP 200, not a 500.
+
+    The data template encodes 1200 latin-1 supplement characters per
+    item. Each character takes two bytes in UTF-8, so the substituted
+    payload comes in well over QR version 40's binary capacity (~2300
+    bytes), which makes ``qrcode.make`` raise ``ValueError`` partway
+    through the batch. The data_template length itself stays under
+    ``MAX_DATA_LENGTH`` so the request passes form validation and the
+    route does enter streaming mode.
+    """
+    rv = client.post(
+        "/api/qr/batch/stream",
+        data={
+            "start": "1",
+            "count": "1",
+            "format": "zip",
+            "data_template": "\u00e9" * 1200,
+            "label_template": "",
+        },
+    )
+    # Status remains 200 because validation passed and streaming began
+    # before the ValueError was raised.
+    assert rv.status_code == 200
+    assert rv.content_type.startswith("application/x-ndjson")
+
+    events = _parse_ndjson(rv.get_data())
+    # We saw the ``start`` event before failing.
+    assert events[0]["event"] == "start"
+    # The terminal event is ``error``, never ``result``.
+    terminal = events[-1]
+    assert terminal["event"] == "error"
+    assert "could not be encoded" in terminal["error"]
+    # No ``result`` event was emitted.
+    assert all(evt.get("event") != "result" for evt in events)

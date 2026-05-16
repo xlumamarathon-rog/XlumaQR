@@ -342,27 +342,29 @@ def api_batch_stream() -> Response:
             }
         )
 
-        # Render items one at a time so we can emit a ``progress`` event
-        # after each one. The rendered pairs are buffered in a list and
-        # packed into the final container at the end. This means progress
-        # events arrive live during rendering (the slow part), and the
-        # client sees the percentage climb to 100% before the final
-        # ``result`` event lands. Packing into a ZIP/PDF after all images
-        # are rendered is cheap relative to QR generation.
-        rendered: list = []
+        # Drive the streaming packer one item at a time. ``items`` is
+        # the lazy iterator returned by :func:`generate_sequence`, and
+        # ``iter_batch_with_progress`` is itself a generator that pulls
+        # one ``(filename, image)`` pair per turn, writes it into the
+        # output container, then yields a ``("progress", ...)`` tuple
+        # back. This keeps peak memory at roughly one PIL Image rather
+        # than buffering all N images while we wait to start packing.
         try:
-            for index, (name, image) in enumerate(items):
-                rendered.append((name, image))
-                yield _ndjson(
-                    {
-                        "event": "progress",
-                        "index": index,
-                        "total": total,
-                        "name": name,
-                    }
-                )
-
-            payload = iter_batch_with_progress(iter(rendered), fmt)
+            payload: bytes | None = None
+            for token in iter_batch_with_progress(items, fmt):
+                kind = token[0]
+                if kind == "progress":
+                    _, index, name = token
+                    yield _ndjson(
+                        {
+                            "event": "progress",
+                            "index": index,
+                            "total": total,
+                            "name": name,
+                        }
+                    )
+                elif kind == "result":
+                    payload = token[1]
         except ValueError as exc:
             yield _ndjson(
                 {"event": "error", "error": f"batch could not be encoded: {exc}"}
@@ -370,6 +372,16 @@ def api_batch_stream() -> Response:
             return
         except Exception as exc:  # pragma: no cover - defensive catch-all
             yield _ndjson({"event": "error", "error": str(exc)})
+            return
+
+        # ``payload`` is set by the terminal ``("result", bytes)`` token
+        # the helper yields exactly once. If it is missing here, the
+        # helper contract was violated; surface that as an error event
+        # rather than a 500.
+        if payload is None:  # pragma: no cover - contract violation
+            yield _ndjson(
+                {"event": "error", "error": "internal error: empty batch payload"}
+            )
             return
 
         yield _ndjson(

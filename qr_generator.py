@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import io
 import zipfile
-from typing import Callable, Iterable, Iterator
+from typing import Iterable, Iterator
 
 import qrcode
 from PIL import Image, ImageDraw, ImageFont
@@ -345,17 +345,23 @@ def images_to_pdf(
 def iter_batch_with_progress(
     items: Iterable[tuple[str, Image.Image]],
     fmt: str,
-    progress_cb: Callable[[int, str], None] | None = None,
-) -> bytes:
-    """Pack ``items`` into a ZIP or PDF, invoking ``progress_cb`` per item.
+) -> Iterator[tuple]:
+    """Pack ``items`` into a ZIP or PDF, yielding progress events lazily.
 
-    This is a thin streaming wrapper around :func:`images_to_zip` and
+    This is the streaming counterpart to :func:`images_to_zip` and
     :func:`images_to_pdf`. ``items`` is consumed lazily (typically the
-    iterator returned by :func:`generate_sequence`); after each
-    ``(filename, image)`` pair has been pulled and rendered into the
-    output container, ``progress_cb(index_zero_based, filename)`` is
-    invoked, where ``index_zero_based`` starts at ``0`` for the first
-    item and increases monotonically.
+    iterator returned by :func:`generate_sequence`) so only one
+    ``(filename, PIL.Image.Image)`` pair is alive at a time. After each
+    pair has been pulled and written into the output container, a
+    progress tuple is yielded; once the source iterator is exhausted, a
+    single result tuple is yielded carrying the packed bytes.
+
+    Yields
+    ------
+    tuple
+        Either ``("progress", index_zero_based, filename)`` after each
+        item is rendered into the container, or
+        ``("result", payload_bytes)`` exactly once at the end.
 
     Parameters
     ----------
@@ -363,26 +369,82 @@ def iter_batch_with_progress(
         Iterable of ``(filename, PIL.Image.Image)`` pairs.
     fmt:
         ``"zip"`` or ``"pdf"``. Anything else raises :class:`ValueError`.
-    progress_cb:
-        Optional callable invoked once per item after it has been
-        consumed by the packer. ``None`` disables progress reporting.
 
-    Returns
-    -------
-    bytes
-        The raw bytes of the ZIP archive or PDF document.
+    Notes
+    -----
+    The generator is the natural shape for an HTTP layer that wants to
+    flush a wire-level progress event after each rendered item: the
+    caller drives the loop with ``next()`` (or ``for``), forwards each
+    progress tuple to the wire, and turns the terminal result tuple
+    into the final response chunk. Encoder ``ValueError`` propagates
+    out of the iterator so the caller can surface it as a clean
+    application-level error.
     """
     if fmt not in {"zip", "pdf"}:
         raise ValueError("fmt must be 'zip' or 'pdf'")
 
-    def _wrap() -> Iterator[tuple[str, Image.Image]]:
-        for index, pair in enumerate(items):
-            yield pair
-            if progress_cb is not None:
-                # ``pair`` is (filename, image); only the filename is
-                # interesting to a progress consumer.
-                progress_cb(index, pair[0])
-
     if fmt == "zip":
-        return images_to_zip(_wrap())
-    return images_to_pdf(_wrap())
+        # Build the ZIP incrementally so each entry is written into the
+        # archive and then released before the next image is rendered.
+        # Peak live state is one ``PIL.Image`` plus its PNG buffer.
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(
+            buffer, mode="w", compression=zipfile.ZIP_DEFLATED
+        ) as zf:
+            for index, (filename, image) in enumerate(items):
+                png_buf = io.BytesIO()
+                image.save(png_buf, format="PNG")
+                zf.writestr(filename, png_buf.getvalue())
+                yield ("progress", index, filename)
+        yield ("result", buffer.getvalue())
+        return
+
+    # PDF: same lazy contract. We mirror the layout maths from
+    # :func:`images_to_pdf` here rather than feeding the canvas through
+    # an iterator wrapper, because the caller wants progress emitted
+    # *between* draws, which would require a coroutine-shaped wrapper
+    # around ``images_to_pdf``. Inlining is shorter and clearer.
+    buffer = io.BytesIO()
+    page_w, page_h = LETTER
+    margin_pt = 36.0
+    cols = 3
+    rows = 4
+    usable_w = page_w - 2 * margin_pt
+    usable_h = page_h - 2 * margin_pt
+    cell_w = usable_w / cols
+    cell_h = usable_h / rows
+
+    c = pdf_canvas.Canvas(buffer, pagesize=LETTER)
+    per_page = cols * rows
+    for index, (filename, image) in enumerate(items):
+        slot = index % per_page
+        if index > 0 and slot == 0:
+            c.showPage()
+
+        col = slot % cols
+        row = slot // cols
+
+        img_w, img_h = image.size
+        scale = min(cell_w / img_w, cell_h / img_h)
+        draw_w = img_w * scale
+        draw_h = img_h * scale
+
+        cell_left = margin_pt + col * cell_w
+        cell_bottom = page_h - margin_pt - (row + 1) * cell_h
+        x = cell_left + (cell_w - draw_w) / 2
+        y = cell_bottom + (cell_h - draw_h) / 2
+
+        c.drawImage(
+            ImageReader(image),
+            x,
+            y,
+            width=draw_w,
+            height=draw_h,
+            preserveAspectRatio=True,
+            mask="auto",
+        )
+        yield ("progress", index, filename)
+
+    c.showPage()
+    c.save()
+    yield ("result", buffer.getvalue())
