@@ -884,11 +884,13 @@ def test_single_logo_wrong_mime_returns_400(client) -> None:
 
 
 def test_single_logo_overlarge_dimensions_returns_400(client) -> None:
-    """A PNG bigger than MAX_LOGO_DIMENSION on either axis must be rejected."""
+    """A PNG bigger than LOGO_HARD_MAX_DIMENSION on either axis must be rejected."""
     from PIL import Image as _Image
-    from qr_generator import MAX_LOGO_DIMENSION as _MAX_DIM
+    from qr_generator import LOGO_HARD_MAX_DIMENSION as _HARD_MAX
 
-    big = _Image.new("RGB", (_MAX_DIM + 1, _MAX_DIM + 1), (200, 200, 200))
+    big = _Image.new(
+        "RGB", (_HARD_MAX + 1, _HARD_MAX + 1), (200, 200, 200)
+    )
     buf = io.BytesIO()
     big.save(buf, format="PNG")
     buf.seek(0)
@@ -904,6 +906,66 @@ def test_single_logo_overlarge_dimensions_returns_400(client) -> None:
     body = rv.get_json()
     assert body is not None and "error" in body
     assert "dimension" in body["error"].lower()
+
+
+def test_single_logo_overlarge_auto_resized_succeeds(client) -> None:
+    """A PNG above MAX_LOGO_DIMENSION but within LOGO_HARD_MAX_DIMENSION
+    must be auto-resized and embedded, not rejected.
+
+    A 2000x2000 solid-orange PNG sits comfortably between the soft
+    auto-resize target (``MAX_LOGO_DIMENSION = 1024``) and the hard
+    ceiling (``LOGO_HARD_MAX_DIMENSION = 4096``). The validator must
+    shrink it in place and pass it through to the QR pipeline so the
+    centre pixel of the rendered QR ends up orange-ish, proving the
+    logo really was embedded rather than silently dropped during the
+    resize.
+    """
+    logo_bytes = _orange_logo_bytes(size=(2000, 2000))
+    rv = client.post(
+        "/api/qr/single",
+        data={
+            "data": "hello",
+            "logo": (io.BytesIO(logo_bytes), "logo.png", "image/png"),
+        },
+        content_type="multipart/form-data",
+    )
+    assert rv.status_code == 200, rv.data
+    assert rv.mimetype == "image/png"
+    assert rv.data.startswith(PNG_MAGIC)
+    pixel = _centre_pixel(rv.data)
+    assert _is_orangeish(pixel), (
+        f"centre pixel {pixel!r} is not orange-ish; "
+        "the auto-resized logo did not reach the QR centre"
+    )
+
+
+def test_load_logo_auto_resizes_oversized_logo() -> None:
+    """Unit-level guard for the auto-resize step: a 2000x2000 PNG must
+    come out of ``_load_logo_from_request`` with ``max(image.size)``
+    no greater than ``MAX_LOGO_DIMENSION``. This locks the resize
+    target in place so a future refactor that silently changed the
+    target would break this test.
+    """
+    import app as app_module
+    from qr_generator import MAX_LOGO_DIMENSION as _SOFT_MAX
+
+    logo_bytes = _orange_logo_bytes(size=(2000, 2000))
+    with app_module.app.test_request_context(
+        "/api/qr/single",
+        method="POST",
+        data={
+            "data": "hello",
+            "logo": (io.BytesIO(logo_bytes), "logo.png", "image/png"),
+        },
+        content_type="multipart/form-data",
+    ):
+        image = app_module._load_logo_from_request()
+
+    assert image is not None
+    assert max(image.size) <= _SOFT_MAX, (
+        f"image size {image.size} exceeds MAX_LOGO_DIMENSION={_SOFT_MAX}; "
+        "auto-resize did not run"
+    )
 
 
 def test_single_logo_plus_oversized_payload_returns_400(client) -> None:

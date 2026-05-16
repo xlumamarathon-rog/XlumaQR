@@ -25,6 +25,7 @@ from qr_generator import (
     MAX_DATA_LENGTH,
     MAX_LOGO_BYTES,
     MAX_LOGO_DIMENSION,
+    LOGO_HARD_MAX_DIMENSION,
     MAX_PADDING,
     compute_range,
     generate_qr,
@@ -137,24 +138,40 @@ def _load_logo_from_request() -> Image.Image | None:
 
     1. The upload is read with a hard byte cap of
        :data:`qr_generator.MAX_LOGO_BYTES`. Anything larger raises
-       ``"logo too large"``.
+       ``"logo too large"``. This is a *hard reject* and is not
+       relaxed by the auto-resize behaviour below.
     2. The bytes are sniffed via :func:`PIL.Image.open` followed by
        :meth:`PIL.Image.Image.verify`, which validates the magic bytes
        match a real image. ``verify()`` consumes the image object, so
        the bytes are reopened afterwards for further inspection.
     3. The lazy :func:`PIL.Image.open` exposes ``image.size`` *without*
        allocating the full bitmap. Either dimension exceeding
-       :data:`qr_generator.MAX_LOGO_DIMENSION` raises
-       ``"logo dimensions too large"`` *before* :meth:`Image.load` runs,
-       so a small-on-the-wire / huge-when-decoded PNG (a "decompression
-       bomb": a 12000x12000 single-colour PNG fits comfortably under
-       the 2 MiB byte cap but would allocate ~432 MB of RGB bitmap on
-       decode) can never exhaust memory on the way to the dimension
-       check. PIL's built-in :class:`PIL.Image.DecompressionBombWarning`
+       :data:`qr_generator.LOGO_HARD_MAX_DIMENSION` (the absolute
+       ceiling) raises ``"logo dimensions too large"`` *before*
+       :meth:`Image.load` runs, so a small-on-the-wire / huge-when-decoded
+       PNG (a "decompression bomb") can never exhaust memory on the
+       way to the dimension check. Dimensions above
+       :data:`qr_generator.MAX_LOGO_DIMENSION` but within the hard
+       ceiling are *not* rejected: they are flagged for an auto-resize
+       step that runs after :meth:`Image.load` so the user can drop a
+       phone-camera screenshot into the form without thinking about
+       pixel sizes. PIL's built-in :class:`PIL.Image.DecompressionBombWarning`
        only fires above ~89 MP and is a warning, not an exception, so
        we cannot rely on it.
     4. Only PNG and JPEG images are accepted. Anything else (SVG, BMP,
-       GIF, WEBP, etc.) raises ``"logo must be PNG or JPEG"``.
+       GIF, WEBP, etc.) raises ``"logo must be PNG or JPEG"``. The
+       format check runs *before* the auto-resize step because
+       :meth:`PIL.Image.Image.thumbnail` clears ``image.format``.
+    5. If the lazy size check flagged the upload for auto-resize, the
+       decoded image is shrunk in-place via
+       ``image.thumbnail((MAX_LOGO_DIMENSION, MAX_LOGO_DIMENSION),
+       Image.LANCZOS)`` so the working bitmap returned to the caller
+       always fits inside the resize target while preserving aspect
+       ratio.
+
+    The byte cap (step 1) and the PIL :class:`PIL.Image.DecompressionBombError`
+    catch (step 3) remain *hard rejects*; only the soft dimension cap
+    (``MAX_LOGO_DIMENSION``) is relaxed by the auto-resize behaviour.
 
     PIL's :class:`PIL.UnidentifiedImageError` (raised when a non-image
     file is uploaded with a fake mime type, e.g. a text file) and the
@@ -174,9 +191,9 @@ def _load_logo_from_request() -> Image.Image | None:
     :class:`Exception`, not :class:`OSError`/:class:`SyntaxError`/
     :class:`ValueError`, so it is caught explicitly here and surfaced
     as the ``"logo dimensions too large"`` 400. Such an upload is
-    necessarily larger than our own ``MAX_LOGO_DIMENSION`` cap
-    (1024 per side), so the dimension-cap message is the semantically
-    correct response.
+    necessarily larger than our own ``LOGO_HARD_MAX_DIMENSION`` ceiling
+    (4096 per side), so the dimension-cap message references the hard
+    ceiling rather than the auto-resize target.
     """
     upload = request.files.get("logo")
     if upload is None or not getattr(upload, "filename", ""):
@@ -193,8 +210,9 @@ def _load_logo_from_request() -> Image.Image | None:
     # image object, so we re-open the bytes for further inspection.
     # We silence PIL's ``DecompressionBombWarning`` here: it fires on
     # large headers (above ~89 MP) but is informational, not an error.
-    # Our own ``MAX_LOGO_DIMENSION`` cap below is the authoritative
-    # bound and rejects anything we deem too large.
+    # Our own ``LOGO_HARD_MAX_DIMENSION`` ceiling below is the
+    # authoritative hard reject; uploads above ``MAX_LOGO_DIMENSION``
+    # but within the hard ceiling are auto-resized, not rejected.
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", Image.DecompressionBombWarning)
@@ -205,11 +223,11 @@ def _load_logo_from_request() -> Image.Image | None:
         # warning to an exception inside ``Image.open()`` itself, before
         # our own ``image.size`` check has a chance to run. Map it to
         # the dimension-cap error: such an upload is necessarily larger
-        # than our own ``MAX_LOGO_DIMENSION`` cap. Caught explicitly
-        # because ``DecompressionBombError`` extends ``Exception``
-        # directly, not the narrower types below.
+        # than our own ``LOGO_HARD_MAX_DIMENSION`` ceiling. Caught
+        # explicitly because ``DecompressionBombError`` extends
+        # ``Exception`` directly, not the narrower types below.
         raise ValueError(
-            f"logo dimensions too large (max {MAX_LOGO_DIMENSION}x{MAX_LOGO_DIMENSION})"
+            f"logo dimensions too large (max {LOGO_HARD_MAX_DIMENSION}x{LOGO_HARD_MAX_DIMENSION})"
         ) from exc
     except UnidentifiedImageError as exc:
         raise ValueError("logo could not be decoded") from exc
@@ -222,16 +240,19 @@ def _load_logo_from_request() -> Image.Image | None:
         raise ValueError("logo could not be decoded") from exc
 
     # Second pass: open lazily so ``image.size`` is available without
-    # decoding the full bitmap. Reject oversized dimensions *before*
-    # calling ``load()`` so a decompression-bomb upload (small on the
-    # wire, huge on decode) is rejected before allocating the bitmap.
+    # decoding the full bitmap. Reject dimensions above the hard
+    # ceiling *before* calling ``load()`` so a decompression-bomb
+    # upload (small on the wire, huge on decode) is rejected before
+    # allocating the bitmap. Dimensions within the hard ceiling but
+    # above the soft auto-resize target are flagged here and shrunk
+    # after ``load()`` and the format check.
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", Image.DecompressionBombWarning)
             image = Image.open(io.BytesIO(raw))
     except Image.DecompressionBombError as exc:
         raise ValueError(
-            f"logo dimensions too large (max {MAX_LOGO_DIMENSION}x{MAX_LOGO_DIMENSION})"
+            f"logo dimensions too large (max {LOGO_HARD_MAX_DIMENSION}x{LOGO_HARD_MAX_DIMENSION})"
         ) from exc
     except UnidentifiedImageError as exc:
         raise ValueError("logo could not be decoded") from exc
@@ -239,14 +260,17 @@ def _load_logo_from_request() -> Image.Image | None:
         raise ValueError("logo could not be decoded") from exc
 
     width, height = image.size
-    if width > MAX_LOGO_DIMENSION or height > MAX_LOGO_DIMENSION:
+    if width > LOGO_HARD_MAX_DIMENSION or height > LOGO_HARD_MAX_DIMENSION:
         raise ValueError(
-            f"logo dimensions too large (max {MAX_LOGO_DIMENSION}x{MAX_LOGO_DIMENSION})"
+            f"logo dimensions too large (max {LOGO_HARD_MAX_DIMENSION}x{LOGO_HARD_MAX_DIMENSION})"
         )
+    needs_resize = width > MAX_LOGO_DIMENSION or height > MAX_LOGO_DIMENSION
 
     # Now that the dimension cap has bounded the worst-case bitmap to
-    # ``MAX_LOGO_DIMENSION**2 * 4`` bytes (~4 MB at the 1024 cap with
-    # an RGBA decode), decode the bitmap.
+    # ``LOGO_HARD_MAX_DIMENSION ** 2 * 4`` bytes (~64 MB at the 4096
+    # ceiling with an RGBA decode), decode the bitmap. The auto-resize
+    # below runs *after* ``load()`` so this bound holds for every
+    # accepted upload.
     try:
         image.load()
     except UnidentifiedImageError as exc:
@@ -257,6 +281,16 @@ def _load_logo_from_request() -> Image.Image | None:
     fmt = (image.format or "").upper()
     if fmt not in {"PNG", "JPEG"}:
         raise ValueError("logo must be PNG or JPEG")
+
+    # Auto-resize last: ``Image.thumbnail`` clears ``image.format``, so
+    # this step has to follow the format check above. Anything that
+    # passed the hard-ceiling check but is above the soft auto-resize
+    # target is shrunk in-place to fit inside ``MAX_LOGO_DIMENSION`` on
+    # both axes while preserving aspect ratio.
+    if needs_resize:
+        image.thumbnail(
+            (MAX_LOGO_DIMENSION, MAX_LOGO_DIMENSION), Image.LANCZOS
+        )
 
     return image
 

@@ -211,22 +211,31 @@ all accept two optional fields that style the rendered QR codes:
   centre of every QR. The HTTP layer enforces three validation limits
   before the bytes ever reach the encoder; failures all return a clean
   HTTP 400 with a JSON `error` body, never a 500:
-  - byte cap: `MAX_LOGO_BYTES = 2 * 1024 * 1024` (2 MB)
-  - dimension cap: `MAX_LOGO_DIMENSION = 1024` on each axis
+  - byte cap: `MAX_LOGO_BYTES = 2 * 1024 * 1024` (2 MB). Hard reject.
+  - dimension policy: uploads above `MAX_LOGO_DIMENSION = 1024` on
+    either axis are auto-resized down to fit, preserving aspect ratio,
+    so users can drop a phone-camera screenshot into the form without
+    thinking about pixel sizes. Only uploads above
+    `LOGO_HARD_MAX_DIMENSION = 4096` per side are rejected outright,
+    as a hard reject for OOM safety.
   - format cap: only PNG and JPEG are accepted (mime sniffing via
     PIL `Image.verify` plus `Image.format`, so a renamed `.txt`
-    pretending to be `image/png` is caught)
+    pretending to be `image/png` is caught). The format check runs
+    before the auto-resize step because PIL's `Image.thumbnail`
+    clears `image.format`.
 
-  The dimension cap is also what bounds the decoded bitmap. A
+  The hard dimension ceiling is what bounds the decoded bitmap. A
   pathologically compressible PNG (a single-colour 12000x12000 image
   is well under the 2 MB byte cap on the wire but would decode to
   ~432 MB of RGB pixels) is rejected on its declared header
   dimensions *before* PIL allocates the bitmap, so a
   decompression-bomb upload cannot exhaust the Lambda's memory on the
-  way to the dimension check. Worst-case decoded memory for any
-  upload that passes validation is therefore roughly
-  `MAX_LOGO_DIMENSION**2 * 4` bytes (~4 MB at the 1024 cap with an
-  RGBA decode).
+  way to the dimension check. The auto-resize step runs *after*
+  `Image.load()` so the worst-case decoded memory for any upload that
+  passes validation is roughly `LOGO_HARD_MAX_DIMENSION**2 * 4` bytes
+  (~64 MB at the 4096 ceiling with an RGBA decode); the byte cap and
+  PIL's `DecompressionBombError` (raised above ~178 MP from inside
+  `Image.open` itself) remain hard rejects regardless.
 
 When a logo is supplied, the encoder is bumped to error-correction
 level H (15-30% recovery, vs M's 15%) so the QR stays scannable with

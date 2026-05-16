@@ -82,6 +82,7 @@ __all__ = [
     "MAX_PADDING",
     "MAX_LOGO_BYTES",
     "MAX_LOGO_DIMENSION",
+    "LOGO_HARD_MAX_DIMENSION",
     "LOGO_WORK_SIZE",
 ]
 
@@ -101,14 +102,22 @@ __all__ = [
 # regardless of character set; callers that exceed it should see a 400
 # from the HTTP layer rather than a 500 from the encoder.
 #
-# ``MAX_LOGO_BYTES`` / ``MAX_LOGO_DIMENSION`` are advisory limits the HTTP
-# layer enforces on uploaded logo bitmaps so a single multipart request
-# cannot exhaust the Lambda's memory. ``LOGO_WORK_SIZE`` is the working
-# size we resize a validated logo down to before pasting it onto the QR;
-# the QR centre region we hand to ``StyledPilImage`` is small (about 22%
-# of the QR width, so a few hundred pixels at most for a typical render)
-# and resizing once up-front avoids a fresh LANCZOS resize per item when
-# the same logo is reused across a batch.
+# ``MAX_LOGO_BYTES`` is the hard byte cap on the multipart upload so a
+# single request cannot exhaust the Lambda's memory. ``MAX_LOGO_DIMENSION``
+# is the *auto-resize target*: uploads above this on either axis are
+# scaled down to fit (preserving aspect ratio) by the HTTP layer's
+# validator rather than rejected outright, so users can drop a phone
+# camera screenshot into the form without thinking about pixel sizes.
+# ``LOGO_HARD_MAX_DIMENSION`` is the absolute ceiling: dimensions above
+# this are rejected with a 400 because the worst-case decoded bitmap
+# (``LOGO_HARD_MAX_DIMENSION ** 2 * 4`` bytes for an RGBA decode, ~64 MB
+# at 4096) is the largest allocation the validator will tolerate before
+# the auto-resize step. ``LOGO_WORK_SIZE`` is the working size we
+# resize a validated logo down to before pasting it onto the QR; the QR
+# centre region we hand to ``StyledPilImage`` is small (about 22% of
+# the QR width, so a few hundred pixels at most for a typical render)
+# and resizing once up-front avoids a fresh LANCZOS resize per item
+# when the same logo is reused across a batch.
 MAX_RANGE_SIZE = 5000
 MAX_DATA_LENGTH = 2300
 MAX_BOX_SIZE = 50
@@ -116,6 +125,7 @@ MAX_BORDER = 16
 MAX_PADDING = 12
 MAX_LOGO_BYTES = 2 * 1024 * 1024
 MAX_LOGO_DIMENSION = 1024
+LOGO_HARD_MAX_DIMENSION = 4096
 LOGO_WORK_SIZE = 256
 
 
