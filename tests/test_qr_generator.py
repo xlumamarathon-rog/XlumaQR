@@ -33,18 +33,44 @@ def test_generate_qr_returns_pil_image_with_expected_size() -> None:
     assert width > 0
 
 
-def test_generate_qr_with_label_increases_height_and_image_is_decodable_as_png_bytes() -> None:
+def test_generate_qr_with_label_no_logo_keeps_size_but_changes_centre_pixels() -> None:
     bare = generate_qr("hello", box_size=10, border=4)
     labeled = generate_qr("hello", label="42", box_size=10, border=4)
 
-    # The labelled image is rendered with a clean band below the QR, so
-    # the width is preserved but the height grows by the band's height.
-    assert labeled.size[0] == bare.size[0]
-    assert labeled.size[1] > bare.size[1]
-    # The pixels must differ (the band below adds a new region).
+    # Without a logo the label is drawn as a centred badge ON the QR
+    # pattern (same rounded white pad as the logo embed), so the
+    # overall image size is preserved while the centre pixels change.
+    assert labeled.size == bare.size
+    # The pixels must differ (the centre badge changes the centre
+    # region from the bare QR's monochrome modules to a white pad
+    # carrying the label glyph).
     assert labeled.tobytes() != bare.tobytes()
 
     # Round-trip via PNG bytes to confirm the image is a real PNG.
+    buf = io.BytesIO()
+    labeled.save(buf, format="PNG")
+    data = buf.getvalue()
+    assert data.startswith(PNG_MAGIC)
+
+    reopened = Image.open(io.BytesIO(data))
+    reopened.load()
+    assert reopened.size == labeled.size
+
+
+def test_generate_qr_with_label_and_logo_increases_height() -> None:
+    """When both a label and a logo are supplied the logo occupies the
+    centre and the label is rendered as a clean white band below the
+    QR, so the image height grows by the band's height."""
+    logo = Image.new("RGB", (32, 32), (255, 165, 0))
+    bare = generate_qr("hello", logo=logo, box_size=10, border=4)
+    labeled = generate_qr(
+        "hello", label="42", logo=logo, box_size=10, border=4,
+    )
+
+    assert labeled.size[0] == bare.size[0]
+    assert labeled.size[1] > bare.size[1]
+    assert labeled.tobytes() != bare.tobytes()
+
     buf = io.BytesIO()
     labeled.save(buf, format="PNG")
     data = buf.getvalue()
@@ -188,11 +214,13 @@ def test_generate_sequence_label_template_with_unknown_placeholder_is_literal() 
     assert len(items) == 1
     name, image = items[0]
     assert name == "1.png"
-    # The labelled image keeps the bare QR's width but is taller by the
-    # band drawn below; the pixel content must differ (proving the band
+    # The labelled image (no logo, no template) keeps the bare QR's
+    # size: the label is drawn as a centred badge on the QR rather
+    # than in a band below it, so width and height both match the
+    # bare render. The pixel content must differ (proving the badge
     # was actually drawn rather than the bare QR being returned).
     bare = generate_qr("1")
-    assert image.size[0] == bare.size[0] and image.size[1] > bare.size[1]
+    assert image.size == bare.size
     assert image.tobytes() != bare.tobytes()
 
 
@@ -700,13 +728,15 @@ def test_square_gradient_template_renders() -> None:
 
 
 def test_label_band_is_white_with_no_outline() -> None:
-    """The label band drawn below the QR must be a clean white region
-    with no surrounding outline rectangle. Sample pixels just under the
-    QR pattern at the leftmost and rightmost columns: both must be
-    pure white. If a rectangle outline were drawn around the band the
-    leftmost/rightmost pixel of that row would be the outline colour."""
-    bare = generate_qr("hello")
-    labelled = generate_qr("hello", label="42").convert("RGB")
+    """The label band drawn below the QR (when a label is supplied
+    alongside a logo) must be a clean white region with no surrounding
+    outline rectangle. Sample pixels just under the QR pattern at the
+    leftmost and rightmost columns: both must be pure white. If a
+    rectangle outline were drawn around the band the leftmost/rightmost
+    pixel of that row would be the outline colour."""
+    logo = Image.new("RGB", (32, 32), (255, 165, 0))
+    bare = generate_qr("hello", logo=logo)
+    labelled = generate_qr("hello", label="42", logo=logo).convert("RGB")
     qr_w, qr_h = bare.size
 
     sample_y = qr_h + 2
@@ -720,77 +750,122 @@ def test_label_band_is_white_with_no_outline() -> None:
 def test_label_text_uses_template_foreground_colour() -> None:
     """When a template is supplied the label text is drawn in the
     template's foreground colour. ``running-track`` is solid red with
-    front_color = (211, 47, 47); the label band must contain many
-    red-ish pixels and zero pure-black pixels."""
+    front_color = (211, 47, 47).
+
+    This contract holds across BOTH layouts:
+    * (label, no logo): the centre badge sits on a white rounded pad
+      and the glyph is drawn in red. We sample inside a small box
+      centred on the QR's centre and require many red-ish pixels and
+      zero pure-black pixels (any glyph pixel must be red, never
+      plain black).
+    * (label, with logo): the band below the QR uses the same red.
+    """
+    # --- (a) centre-badge layout (no logo) -------------------------
     bare = generate_qr("hello", template_id="running-track")
     labelled = generate_qr(
         "hello", label="42", template_id="running-track",
     ).convert("RGB")
     qr_w, qr_h = bare.size
+    assert labelled.size == bare.size
 
+    # Sample a centred box ~22% of the image (matches the
+    # embedded_image_ratio used by StyledPilImage).
+    half = max(8, int(min(qr_w, qr_h) * 0.22) // 2)
+    cx, cy = qr_w // 2, qr_h // 2
     red_count = 0
     black_count = 0
-    for y in range(qr_h, labelled.size[1]):
-        for x in range(qr_w):
+    for y in range(cy - half, cy + half):
+        for x in range(cx - half, cx + half):
             r, g, b = labelled.getpixel((x, y))
             if r > 150 and g < 100 and b < 100:
                 red_count += 1
             if (r, g, b) == (0, 0, 0):
                 black_count += 1
-
     assert red_count >= 50, (
-        f"expected the label glyphs to produce many red-ish pixels in "
-        f"the band; got {red_count}"
+        f"expected many red-ish pixels inside the centre badge region; "
+        f"got {red_count}"
     )
     assert black_count == 0, (
-        f"label band must not contain any pure-black pixels (text must "
-        f"be drawn in the template's foreground colour, not black); "
-        f"got {black_count}"
+        f"centre badge must not contain any pure-black pixels (text "
+        f"must be drawn in the template's foreground colour, not "
+        f"black); got {black_count}"
+    )
+
+    # --- (b) band-below layout (with logo) -------------------------
+    logo = Image.new("RGB", (32, 32), (255, 165, 0))
+    bare_band = generate_qr("hello", template_id="running-track", logo=logo)
+    labelled_band = generate_qr(
+        "hello", label="42", template_id="running-track", logo=logo,
+    ).convert("RGB")
+    bw, bh = bare_band.size
+    band_red = 0
+    band_black = 0
+    for y in range(bh, labelled_band.size[1]):
+        for x in range(bw):
+            r, g, b = labelled_band.getpixel((x, y))
+            if r > 150 and g < 100 and b < 100:
+                band_red += 1
+            if (r, g, b) == (0, 0, 0):
+                band_black += 1
+    assert band_red >= 50, (
+        f"expected the label glyphs to produce many red-ish pixels in "
+        f"the band; got {band_red}"
+    )
+    assert band_black == 0, (
+        f"label band must not contain any pure-black pixels; "
+        f"got {band_black}"
     )
 
 
 def test_label_uses_bundled_truetype_font_not_bitmap_default() -> None:
     """The label is rendered with the bundled Plus Jakarta Sans Bold
-    TTF, not PIL's bitmap default font. TTF glyphs are anti-aliased and
-    therefore introduce many partial-coverage pixels along the strokes;
-    PIL's bitmap default font renders only pure black or pure white at
-    the glyph boundary. We compare the count of non-pure-white,
-    non-pure-black pixels in the band: the TTF render must produce at
-    least 3x as many as the bitmap default."""
+    TTF, not PIL's bitmap default font. TTF glyphs are anti-aliased
+    and therefore introduce many partial-coverage pixels along the
+    strokes; PIL's bitmap default font renders only pure black or
+    pure white at the glyph boundary. We compare the count of
+    non-pure-white, non-pure-black pixels inside the centre badge
+    region: the production (TTF) render must produce at least 3x as
+    many as a control rendered with the bitmap default font centred
+    at the same coordinates."""
     from PIL import Image as _Image
     from PIL import ImageDraw as _ImageDraw
     from PIL import ImageFont as _ImageFont
 
     label = "42"
-    bare = generate_qr("hello")
+    # No logo -> the label lands as a centred badge on the QR.
     labelled = generate_qr("hello", label=label).convert("RGB")
-    qr_w, qr_h = bare.size
-    band_h = labelled.size[1] - qr_h
+    qr_w, qr_h = labelled.size
 
-    # Build a control band with the same dimensions and centre the
-    # default bitmap font in it the same way the production code
-    # centres the TTF rendering.
-    control = _Image.new("RGB", (qr_w, band_h), (255, 255, 255))
+    # Build a control RGBA canvas of the same overall image size and
+    # centre-draw the same label with the bitmap default font at the
+    # QR's centre.
+    control = _Image.new("RGB", (qr_w, qr_h), (255, 255, 255))
     cdraw = _ImageDraw.Draw(control)
     default_font = _ImageFont.load_default()
     bbox = cdraw.textbbox((0, 0), label, font=default_font)
     text_w = bbox[2] - bbox[0]
     text_h = bbox[3] - bbox[1]
     text_x = (qr_w - text_w) // 2 - bbox[0]
-    text_y = (band_h - text_h) // 2 - bbox[1]
+    text_y = (qr_h - text_h) // 2 - bbox[1]
     cdraw.text((text_x, text_y), label, fill=(0, 0, 0), font=default_font)
 
-    def _count_anti_aliased(img: _Image.Image, y_start: int, y_end: int) -> int:
+    # The centre badge sits inside a square ~22% of the image (matches
+    # embedded_image_ratio). Count anti-aliased pixels in that box on
+    # both images.
+    half = max(8, int(min(qr_w, qr_h) * 0.22) // 2)
+    cx, cy = qr_w // 2, qr_h // 2
+
+    def _count_anti_aliased(img: _Image.Image) -> int:
         count = 0
-        for y in range(y_start, y_end):
-            for x in range(img.width):
+        for y in range(cy - half, cy + half):
+            for x in range(cx - half, cx + half):
                 px = img.getpixel((x, y))
                 if px not in {(0, 0, 0), (255, 255, 255)}:
                     count += 1
         return count
 
-    ttf_count = _count_anti_aliased(labelled, qr_h, labelled.size[1])
-    default_count = _count_anti_aliased(control, 0, band_h)
+    ttf_count = _count_anti_aliased(labelled)
+    default_count = _count_anti_aliased(control)
 
     assert ttf_count >= 3 * max(1, default_count), (
         f"expected anti-aliased TTF glyphs to produce at least 3x the "
@@ -823,3 +898,53 @@ def test_label_color_from_spec_picks_correct_stop() -> None:
 
     with pytest.raises(ValueError, match="unknown color_mask_kind"):
         _label_color_from_spec({"color_mask_kind": "rainbow"})
+
+
+# --- Centre-badge label (FEAT-002) ---------------------------------
+
+
+def test_label_centre_badge_white_pad_around_glyph() -> None:
+    """The centre badge sits on a white rounded pad behind the glyph
+    so the QR remains scannable. Sample several pixels inside the
+    centre region but outside the glyph strokes (a small ring around
+    the centre on the diagonal axes that should miss the strokes of a
+    short numeric label) and assert at least one of them is pure
+    white. This locks the white-backdrop-for-scannability behaviour
+    in place."""
+    labelled = generate_qr("hello", label="42").convert("RGB")
+    qr_w, qr_h = labelled.size
+    cx, cy = qr_w // 2, qr_h // 2
+
+    # Pick points on the diagonal axes around the centre at radius
+    # ~7% of the QR width. For a short numeric label like "42" sitting
+    # inside the inner ~80% of a 22%-of-the-image badge, points off
+    # the diagonal axes at this radius should land on the white pad
+    # rather than on the glyph strokes.
+    radius = max(4, int(qr_w * 0.07))
+    sample_points = [
+        (cx + radius, cy + radius),
+        (cx - radius, cy + radius),
+        (cx + radius, cy - radius),
+        (cx - radius, cy - radius),
+    ]
+    pixels = [labelled.getpixel(p) for p in sample_points]
+    assert any(p == (255, 255, 255) for p in pixels), (
+        f"expected at least one pure-white pixel on the centre-badge "
+        f"diagonal ring (the white rounded pad behind the glyph); got "
+        f"{pixels}"
+    )
+
+
+def test_label_in_centre_bumps_error_correction_to_h() -> None:
+    """A centre label upgrades error correction to H, mirroring the
+    logo path. A payload that fits at M (no label) overflows at H
+    (centre label)."""
+    # Without the label we stay at M and 'A' * 2000 fits at version 40.
+    img = generate_qr("A" * 2000)
+    assert isinstance(img, Image.Image)
+
+    # With a centre label we move to H and the same payload exceeds
+    # the H-mode capacity, surfacing as a ValueError from the
+    # underlying qrcode library.
+    with pytest.raises(ValueError):
+        generate_qr("A" * 2000, label="42")

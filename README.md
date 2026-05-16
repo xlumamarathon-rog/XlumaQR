@@ -260,22 +260,42 @@ NDJSON line on `POST /api/qr/batch/stream`.
 #### Label rendering
 
 When a `label` is supplied (Single QR) or a non-empty `label_template`
-yields a label per item (Sequential Batch), the rendered image is
-taller than the bare QR by a clean white band drawn directly under the
-QR pattern. The band has no outline and no border rectangle: it is a
-flat white extension of the QR's white background.
+yields a label per item (Sequential Batch), the rendered image carries
+the label in one of two layouts depending on whether a logo is also
+embedded:
+
+- **Label without a logo** (centre badge): the label is drawn as a
+  centred badge on the QR pattern, on the same white rounded-square
+  pad an embedded logo would sit on. The image keeps the bare QR's
+  size: width and height both match the unlabeled render. Error
+  correction is bumped to `ERROR_CORRECT_H` so the QR remains
+  scannable with the centre region occupied. As with logo embedding,
+  this trades capacity for resilience: a payload that fits at the
+  default `ERROR_CORRECT_M` without a label may overflow at H with a
+  centre label and surface as a `ValueError` from the underlying
+  `qrcode` library. The same payload would render fine without the
+  label, so callers can fall back to a bare QR (or pick a smaller
+  payload) if they hit the cap.
+- **Label with a logo** (band below): the logo occupies the centre
+  and the label is drawn in a clean white band directly under the QR
+  pattern. The image is taller than the bare QR by the band's
+  height. The band has no outline and no border rectangle; it is a
+  flat white extension of the QR's white background.
 
 The label text is drawn in **Plus Jakarta Sans Bold** loaded from the
 bundled TrueType file at
 [`static/fonts/PlusJakartaSans-Bold.ttf`](static/fonts/PlusJakartaSans-Bold.ttf).
 The font is committed alongside its SIL Open Font License 1.1 file at
 [`static/fonts/OFL.txt`](static/fonts/OFL.txt) so the deployable
-package stays self-contained and no runtime download is required.
-The font size scales with the QR's pixel height (about 12% of the
-height with a 14 px floor), and the padding around the glyph in the
-band scales with the font size on both axes.
+package stays self-contained and no runtime download is required. In
+the band-below layout the font size scales with the QR's pixel height
+(about 12% with a 14 px floor) and the padding around the glyph in
+the band scales with the font size on both axes. In the centre-badge
+layout the font size is auto-fitted to the inner pad area (~70% of
+the badge canvas) starting at ~30% of the badge size and stepping
+down by 4 px until the text bounding box fits, with a 24 px floor.
 
-The label colour follows the chosen template:
+The label colour follows the chosen template in BOTH layouts:
 
 - `default` (and the legacy plain render path when no template is
   supplied) draws the label in pure black.
@@ -289,8 +309,18 @@ So a QR generated with `template_id=running-track` (solid red,
 `front_color=(211, 47, 47)`) prints its label in the same red as the
 QR modules, visually tying the label to the design rather than
 overlaying a separate badge on the pattern. The `label_height` form
-field is retained for backwards compatibility but is now ignored: the
-band's height is derived from the chosen font size.
+field is retained for backwards compatibility but is now ignored: in
+the band-below layout the band's height is derived from the chosen
+font size, and in the centre-badge layout there is no band at all.
+
+> **Backward-compat note:** `generate_qr('hello')` (no `label`, no
+> `template_id`, no `logo`) is still byte-for-byte identical to
+> earlier releases. Once any of `label`, `template_id`, or `logo` is
+> supplied the output goes through the styled render path and is no
+> longer guaranteed to match the legacy bytes; in particular,
+> `generate_qr('hello', label='42')` (no template, no logo) now
+> produces a centre badge rather than a band below and so differs
+> from the bytes earlier releases produced for the same call.
 
 #### `GET /api/qr/templates`
 

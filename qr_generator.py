@@ -865,6 +865,71 @@ def _is_default_template(template_id: str | None) -> bool:
     return template_id is None or template_id == "default"
 
 
+def _render_label_badge(
+    label: str,
+    fg_color: tuple[int, int, int],
+    target_size_px: int = LOGO_WORK_SIZE,
+) -> Image.Image:
+    """Render ``label`` as a centred badge on a white rounded-square pad.
+
+    Returns an RGBA image of size ``target_size_px`` square containing
+    ``label`` rendered in ``fg_color`` on the same white rounded pad
+    that :func:`_pad_logo` builds for an embedded logo. The pad shape
+    (rounded corners, ~80% inner area, white fill) is shared with the
+    logo embed by routing the rendered text image through
+    :func:`_pad_logo` itself, so the centre badge and the logo embed
+    are visually consistent and any future tweak to the pad geometry
+    flows to both code paths automatically.
+
+    The font size is auto-fitted: it starts at ~30% of
+    ``target_size_px`` and shrinks in 4 px steps until the rendered
+    text bounding box fits inside ~70% of the canvas on both axes,
+    with a hard floor of 24 px so very long labels still render at a
+    legible size (the text image will be downscaled by
+    :func:`_pad_logo`'s thumbnail step in that case).
+    """
+    if target_size_px <= 0:
+        raise ValueError("target_size_px must be > 0")
+
+    inner_max = max(1, int(target_size_px * 0.70))
+    font_size = max(24, int(target_size_px * 0.30))
+    floor = 24
+
+    font = _load_label_font(font_size)
+    measure = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    while True:
+        try:
+            bbox = measure.textbbox((0, 0), label, font=font)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
+            text_offset_x = -bbox[0]
+            text_offset_y = -bbox[1]
+        except AttributeError:
+            # Pillow < 9.2 fallback.
+            text_w, text_h = measure.textsize(label, font=font)  # type: ignore[attr-defined]
+            text_offset_x = 0
+            text_offset_y = 0
+        if (text_w <= inner_max and text_h <= inner_max) or font_size <= floor:
+            break
+        font_size = max(floor, font_size - 4)
+        font = _load_label_font(font_size)
+
+    # Render the glyph onto an RGBA scratch canvas sized to its bbox so
+    # _pad_logo can centre it inside the pad's inner ~80% area.
+    scratch_w = max(1, text_w)
+    scratch_h = max(1, text_h)
+    text_img = Image.new("RGBA", (scratch_w, scratch_h), (0, 0, 0, 0))
+    tdraw = ImageDraw.Draw(text_img)
+    tdraw.text(
+        (text_offset_x, text_offset_y),
+        label,
+        fill=(fg_color[0], fg_color[1], fg_color[2], 255),
+        font=font,
+    )
+
+    return _pad_logo(text_img, target_size_px)
+
+
 def generate_qr(
     data: str,
     label: str | None = None,
@@ -874,51 +939,69 @@ def generate_qr(
     template_id: str | None = None,
     logo: Image.Image | None = None,
 ) -> Image.Image:
-    """Render ``data`` as a QR code with an optional label band below.
+    """Render ``data`` as a QR code with an optional label.
 
-    When neither ``template_id`` nor ``logo`` is supplied (the common
-    case), the QR is built with :data:`qrcode.constants.ERROR_CORRECT_M`
-    and rendered via the legacy ``qr.make_image(fill_color, back_color)``
-    path, byte-for-byte identical to earlier releases.
+    The optional ``label`` is rendered in one of two layouts depending
+    on whether a ``logo`` is also supplied:
 
-    When ``template_id`` is supplied (and is not the literal ``default``),
-    the QR is rendered through ``qrcode.image.styledpil.StyledPilImage``
-    using the template's module drawer and colour mask. When ``logo`` is
-    supplied, error correction is bumped to
-    :data:`qrcode.constants.ERROR_CORRECT_H` (15%-30% recovery vs M's
-    15%) and the logo is wrapped in a white rounded-square pad before
-    being passed in as ``embedded_image`` so the QR remains scannable.
-    A payload that fits at M but exceeds the H-mode capacity will raise
-    :class:`ValueError` from inside the underlying ``qrcode`` library.
+    * **No logo, label only**: the label is drawn as a centred badge on
+      the QR pattern, on the same white rounded-square pad that an
+      embedded logo would sit on. Error correction is bumped to
+      :data:`qrcode.constants.ERROR_CORRECT_H` so the QR remains
+      scannable with the centre region occupied. A payload that fits
+      at M-mode without a label may overflow at H-mode with a centre
+      label, in the same way a logo embed does, surfacing as a
+      :class:`ValueError` from the underlying ``qrcode`` library.
+    * **Logo plus label**: the logo occupies the centre and the label
+      is rendered in a clean white band drawn directly under the QR
+      pattern. The returned image is taller than the bare QR by the
+      band's height. The band's font size scales with the QR's pixel
+      height (~12% with a 14 px floor) and uses the bundled
+      Plus Jakarta Sans Bold TTF (see :data:`LABEL_FONT_PATH`).
 
-    When a ``label`` is supplied, the returned image is taller than the
-    bare QR by a clean white band that contains the label, drawn in the
-    template's foreground colour using the bundled Plus Jakarta Sans
-    Bold TrueType font (see :data:`LABEL_FONT_PATH`). The legacy plain
-    render path uses pure black for the label text.
+    When neither ``template_id`` nor ``logo`` nor ``label`` is supplied
+    (the common case), the QR is built with
+    :data:`qrcode.constants.ERROR_CORRECT_M` and rendered via the
+    legacy ``qr.make_image(fill_color, back_color)`` path,
+    byte-for-byte identical to earlier releases. Note that supplying a
+    ``label`` alone (no ``template_id``, no ``logo``) now routes
+    through the styled path with a centre badge: those bytes no longer
+    match the legacy output. The legacy bytes are preserved only when
+    ``label``, ``template_id``, and ``logo`` are all unset.
+
+    When ``template_id`` is supplied (and is not the literal
+    ``default``), the QR is rendered through
+    ``qrcode.image.styledpil.StyledPilImage`` using the template's
+    module drawer and colour mask. The label colour follows the
+    template's representative stop (see :func:`_label_color_from_spec`)
+    in both the centre-badge and band-below layouts; the legacy plain
+    path uses pure black for label text.
 
     Parameters
     ----------
     data:
         Payload encoded into the QR code.
     label:
-        Optional text drawn in a band below the QR. ``None`` returns the
-        bare QR.
+        Optional text. ``None`` returns the bare QR. With a logo the
+        label is drawn in a band below the QR; without a logo the
+        label is drawn as a centred badge on the QR.
     box_size:
         Pixel size of each QR module (passed through to ``qrcode``).
     border:
         Quiet-zone width in modules (passed through to ``qrcode``).
     label_height:
-        Deprecated. Retained for backwards compatibility but ignored: the
-        band's height is now derived from the chosen font size, which
-        scales with the QR's pixel height.
+        Deprecated. Retained for backwards compatibility but ignored:
+        the band's height (when a label and a logo are both supplied)
+        is now derived from the chosen font size, which scales with
+        the QR's pixel height.
     template_id:
-        Optional template slug. ``None`` and ``"default"`` both take the
-        legacy plain-black-on-white render path. Any other id is resolved
-        via :func:`get_template` (raises :class:`ValueError` on unknown).
+        Optional template slug. ``None`` and ``"default"`` both take
+        the legacy plain-black-on-white render path when no centre
+        region is occupied. Any other id is resolved via
+        :func:`get_template` (raises :class:`ValueError` on unknown).
     logo:
-        Optional :class:`PIL.Image.Image` to embed at the centre of the
-        QR. When supplied, error correction is upgraded to
+        Optional :class:`PIL.Image.Image` to embed at the centre of
+        the QR. When supplied, error correction is upgraded to
         ``ERROR_CORRECT_H`` and the logo is pre-wrapped in a white
         rounded-square pad. If only ``logo`` is supplied without a
         template, the ``default`` template (plain black on white) is
@@ -927,10 +1010,18 @@ def generate_qr(
     Returns
     -------
     PIL.Image.Image
-        RGB image of the rendered QR. When ``label`` is supplied the
-        image is taller than the bare QR by the height of the label band.
+        RGB image of the rendered QR. When ``label`` is supplied
+        alongside a ``logo`` the image is taller than the bare QR by
+        the height of the label band; when ``label`` is supplied
+        without a ``logo`` the image keeps the bare QR's size and the
+        centre region carries the label badge.
     """
-    use_styled = not _is_default_template(template_id) or logo is not None
+    centre_label = label is not None and logo is None
+    use_styled = (
+        not _is_default_template(template_id)
+        or logo is not None
+        or centre_label
+    )
 
     spec: dict | None = None
     if not use_styled:
@@ -944,14 +1035,19 @@ def generate_qr(
         qr.make(fit=True)
         qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
     else:
-        # --- Styled path: StyledPilImage with optional embedded logo.
+        # --- Styled path: StyledPilImage with optional embedded logo
+        #     or centre label badge.
         spec_id = template_id if template_id is not None else "default"
         template = get_template(spec_id)
         spec = template["spec"]
         drawer = _resolve_drawer(spec["module_drawer_kind"])
         color_mask = _resolve_color_mask(spec)
 
-        error_correction = ERROR_CORRECT_H if logo is not None else ERROR_CORRECT_M
+        error_correction = (
+            ERROR_CORRECT_H
+            if (logo is not None or centre_label)
+            else ERROR_CORRECT_M
+        )
         qr = qrcode.QRCode(
             error_correction=error_correction,
             box_size=box_size,
@@ -960,7 +1056,17 @@ def generate_qr(
         qr.add_data(data)
         qr.make(fit=True)
 
-        embedded_image = _pad_logo(logo, LOGO_WORK_SIZE) if logo is not None else None
+        if logo is not None:
+            embedded_image = _pad_logo(logo, LOGO_WORK_SIZE)
+        elif centre_label:
+            if _is_default_template(template_id):
+                badge_fg: tuple[int, int, int] = (0, 0, 0)
+            else:
+                badge_fg = _label_color_from_spec(spec)
+            embedded_image = _render_label_badge(label, badge_fg, LOGO_WORK_SIZE)
+        else:
+            embedded_image = None
+
         styled = qr.make_image(
             image_factory=StyledPilImage,
             module_drawer=drawer,
@@ -970,9 +1076,12 @@ def generate_qr(
         )
         qr_img = styled.get_image().convert("RGB")
 
-    if label is None:
+    if label is None or centre_label:
+        # No label, or the label is already drawn as a centre badge in
+        # the styled path above; either way nothing more to draw.
         return qr_img
 
+    # --- Band-below layout: label is supplied alongside a logo.
     qr_w, qr_h = qr_img.size
 
     # Choose a font size proportional to the QR's pixel height (~12%)
