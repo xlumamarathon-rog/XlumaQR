@@ -223,41 +223,50 @@ def test_batch_pdf_filename_uses_padded_first_and_last(client) -> None:
 
 
 def test_batch_data_template_substitution_end_to_end(client) -> None:
-    """Issue 10: non-default ``data_template`` is not silently dropped.
+    """Issue v2#4: ``data_template`` must actually substitute ``{n}``.
 
-    With ``data_template='ID-{n}'`` and a non-default ``box_size``, the
-    encoded payload is longer than with the default ``{n}`` template
-    (different byte count -> the ``qrcode`` library picks a slightly
-    different module count, which changes the rendered image size). If
-    the HTTP layer stopped passing the template through, the resulting
-    archive would contain images sized as the default.
+    Use a template that contains ``{n}`` and run it for two different
+    ``start`` values whose decimal representations differ. The encoded
+    payloads will then differ ("Z1Z" vs "Z99999Z") and the rendered PNG
+    bytes must differ as a result. If the HTTP layer dropped substitution
+    or if ``generate_sequence`` regressed, both runs would encode the
+    literal string "Z{n}Z" and the bytes would be identical.
     """
-    rv_default = client.post(
-        "/api/qr/batch",
-        data={"start": "1", "count": "1", "format": "zip"},
-    )
-    rv_custom = client.post(
+    rv_a = client.post(
         "/api/qr/batch",
         data={
             "start": "1",
             "count": "1",
             "format": "zip",
-            "data_template": "ID-{n}-payload-with-extra-content-to-grow-the-qr",
+            "data_template": "Z{n}Z",
+            "label_template": "",
         },
     )
-    assert rv_default.status_code == 200
-    assert rv_custom.status_code == 200
-    from PIL import Image as _Image
+    rv_b = client.post(
+        "/api/qr/batch",
+        data={
+            "start": "99999",
+            "count": "1",
+            "format": "zip",
+            "data_template": "Z{n}Z",
+            "label_template": "",
+        },
+    )
+    assert rv_a.status_code == 200
+    assert rv_b.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(rv_a.data)) as zf:
+        png_a = zf.read("1.png")
+    with zipfile.ZipFile(io.BytesIO(rv_b.data)) as zf:
+        png_b = zf.read("99999.png")
 
-    with zipfile.ZipFile(io.BytesIO(rv_default.data)) as zf:
-        img_default = _Image.open(io.BytesIO(zf.read("1.png")))
-        size_default = img_default.size
-    with zipfile.ZipFile(io.BytesIO(rv_custom.data)) as zf:
-        img_custom = _Image.open(io.BytesIO(zf.read("1.png")))
-        size_custom = img_custom.size
-    # A longer payload forces the QR to a higher version, which produces
-    # a strictly larger rendered image.
-    assert size_custom[0] > size_default[0]
+    # Both PNGs are valid.
+    assert png_a.startswith(PNG_MAGIC)
+    assert png_b.startswith(PNG_MAGIC)
+    # The two encoded payloads differ ("Z1Z" vs "Z99999Z"), so the
+    # rendered PNG bytes must differ. If substitution were dropped both
+    # runs would encode the literal string "Z{n}Z" and produce identical
+    # byte streams.
+    assert png_a != png_b
 
 
 def test_batch_invalid_template_does_not_500(client) -> None:
@@ -290,3 +299,150 @@ def test_batch_prefix_with_path_separator_returns_400(client) -> None:
     assert rv.status_code == 400
     body = rv.get_json()
     assert body is not None and "error" in body
+
+
+# --- Hardening regression tests (semantic-review v2) ----------------
+
+
+def test_single_multibyte_payload_over_capacity_returns_400(client) -> None:
+    """Issue v2#1: a payload that passes the byte-length cap but still
+    exceeds QR version 40 capacity must return 400, not a Flask 500.
+
+    Latin-1 characters with code points >= 128 are encoded as two-byte
+    UTF-8 sequences inside ``qrcode``. A 1200-character string of such
+    characters fits comfortably under ``MAX_DATA_LENGTH`` but overflows
+    the QR encoder's binary-mode capacity, exercising the wrapped
+    ``ValueError`` path.
+    """
+    rv = client.post(
+        "/api/qr/single",
+        data={"data": "\u00e9" * 1200},
+    )
+    assert rv.status_code == 400
+    body = rv.get_json()
+    assert body is not None and "error" in body
+    # The error must surface as a clean message, not the raw stack.
+    assert "could not be encoded" in body["error"]
+
+
+def test_batch_data_template_too_long_returns_400(client) -> None:
+    """Issue v2#2: oversized ``data_template`` must be rejected at the
+    HTTP layer, not surface as a 500 from inside ``qrcode.make``."""
+    from qr_generator import MAX_DATA_LENGTH as _MAX
+
+    rv = client.post(
+        "/api/qr/batch",
+        data={
+            "start": "1",
+            "count": "1",
+            "format": "zip",
+            "data_template": "A" * (_MAX + 1),
+        },
+    )
+    assert rv.status_code == 400
+    body = rv.get_json()
+    assert body is not None and "error" in body
+    assert "data_template" in body["error"]
+
+
+def test_batch_label_template_too_long_returns_400(client) -> None:
+    """Issue v2#2: oversized ``label_template`` must be rejected too."""
+    from qr_generator import MAX_DATA_LENGTH as _MAX
+
+    rv = client.post(
+        "/api/qr/batch",
+        data={
+            "start": "1",
+            "count": "1",
+            "format": "zip",
+            "label_template": "L" * (_MAX + 1),
+        },
+    )
+    assert rv.status_code == 400
+    body = rv.get_json()
+    assert body is not None and "error" in body
+    assert "label_template" in body["error"]
+
+
+def test_batch_padding_above_max_returns_400(client) -> None:
+    """Issue v2#3: ``padding`` is bounded so a 10 000-character padded
+    number cannot reach the encoder."""
+    from qr_generator import MAX_PADDING as _MAX
+
+    rv = client.post(
+        "/api/qr/batch",
+        data={
+            "start": "1",
+            "count": "1",
+            "format": "zip",
+            "padding": str(_MAX + 1),
+        },
+    )
+    assert rv.status_code == 400
+    body = rv.get_json()
+    assert body is not None and "error" in body
+    assert "padding" in body["error"]
+
+
+def test_batch_data_template_substituted_overflow_returns_400(client) -> None:
+    """Issue v2#1+#2: the wrapped-encoder path catches batches where the
+    substituted payload itself overflows QR capacity and surfaces a 400."""
+    from qr_generator import MAX_DATA_LENGTH as _MAX
+
+    # data_template fits under the cap but encodes to multi-byte UTF-8
+    # at a length that exceeds QR version 40 binary capacity (each
+    # latin-1 supplement char uses two bytes in UTF-8 so this packs
+    # roughly 2 * _MAX bytes into the encoder, well past the ~2300-byte
+    # ceiling).
+    rv = client.post(
+        "/api/qr/batch",
+        data={
+            "start": "1",
+            "count": "1",
+            "format": "zip",
+            "data_template": "\u00e9" * _MAX,
+            "label_template": "",
+        },
+    )
+    assert rv.status_code == 400
+    body = rv.get_json()
+    assert body is not None and "error" in body
+    assert "could not be encoded" in body["error"]
+
+
+def test_batch_prefix_with_dots_and_spaces_is_accepted(client) -> None:
+    """Issue v2#6: realistic prefixes (`inv.001-`, `2026 batch `,
+    `tickets.`) must be accepted by the widened class."""
+    for prefix in ("inv.001-", "2026 batch ", "tickets."):
+        rv = client.post(
+            "/api/qr/batch",
+            data={
+                "start": "1",
+                "count": "2",
+                "format": "zip",
+                "prefix": prefix,
+            },
+        )
+        assert rv.status_code == 200, f"{prefix!r} should be accepted"
+        with zipfile.ZipFile(io.BytesIO(rv.data)) as zf:
+            names = zf.namelist()
+            assert names == [f"{prefix}1.png", f"{prefix}2.png"]
+
+
+def test_batch_prefix_with_leading_dot_returns_400(client) -> None:
+    """Issue v2#6: a leading ``.`` prefix is still rejected even though
+    dots are now allowed in the interior of the prefix. This keeps
+    hidden-file names and ``../`` traversal patterns out."""
+    for prefix in (".hidden", "..", "./foo"):
+        rv = client.post(
+            "/api/qr/batch",
+            data={
+                "start": "1",
+                "count": "2",
+                "format": "zip",
+                "prefix": prefix,
+            },
+        )
+        assert rv.status_code == 400, f"{prefix!r} should be rejected"
+        body = rv.get_json()
+        assert body is not None and "error" in body

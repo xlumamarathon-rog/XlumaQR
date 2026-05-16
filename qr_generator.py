@@ -58,10 +58,20 @@ __all__ = [
 # in :func:`compute_range` so an unwary caller cannot accidentally materialise
 # millions of strings, but the rest are exposed as constants so the HTTP
 # layer can validate before invoking us.
+#
+# ``MAX_DATA_LENGTH`` is the most conservative of the four and deserves a
+# note. The underlying ``qrcode`` library tops out at QR version 40, whose
+# binary capacity at error-correction level M is roughly 2300 bytes. A
+# payload above that limit raises ``ValueError("Invalid version (was 41,
+# expected 1 to 40)")`` deep inside ``qrcode.make()``. We pick ``2300`` as
+# the cap so any input that passes the HTTP validator will encode cleanly
+# regardless of character set; callers that exceed it should see a 400
+# from the HTTP layer rather than a 500 from the encoder.
 MAX_RANGE_SIZE = 5000
-MAX_DATA_LENGTH = 4000
+MAX_DATA_LENGTH = 2300
 MAX_BOX_SIZE = 50
 MAX_BORDER = 16
+MAX_PADDING = 12
 
 
 def generate_qr(

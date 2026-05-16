@@ -19,6 +19,7 @@ from qr_generator import (
     MAX_BORDER,
     MAX_BOX_SIZE,
     MAX_DATA_LENGTH,
+    MAX_PADDING,
     compute_range,
     generate_qr,
     generate_sequence,
@@ -30,8 +31,12 @@ app = Flask(__name__)
 
 # ``prefix`` is concatenated unmodified into ZIP entry names. Restrict it
 # to a conservative set so a hostile caller cannot sneak path separators,
-# NULs, or leading dots into the archive.
-_PREFIX_RE = re.compile(r"^[A-Za-z0-9_-]*$")
+# NULs, or leading dots into the archive. The class admits letters,
+# digits, ``_``, ``-``, ``.``, and space so common real-world prefixes
+# (``inv.001-``, ``tickets.``, ``2026 batch ``) are accepted, but any
+# leading ``.`` is rejected to keep hidden-file names and traversal
+# patterns (``../``) out.
+_PREFIX_RE = re.compile(r"^(?![.])[A-Za-z0-9_. -]*$")
 
 
 def _parse_int(
@@ -108,7 +113,13 @@ def api_single() -> Response:
         return jsonify({"error": str(exc)}), 400
 
     assert box_size is not None and border is not None  # defaults guarantee non-None
-    image = generate_qr(data, label=label, box_size=box_size, border=border)
+    try:
+        image = generate_qr(data, label=label, box_size=box_size, border=border)
+    except ValueError as exc:
+        # ``qrcode`` raises ValueError when the encoded payload exceeds
+        # version 40 capacity (e.g. multi-byte UTF-8 input under the cap
+        # but over the byte ceiling). Surface as a 400, not a 500.
+        return jsonify({"error": f"data could not be encoded: {exc}"}), 400
     buf = io.BytesIO()
     image.save(buf, format="PNG")
     buf.seek(0)
@@ -134,6 +145,7 @@ def api_batch() -> Response:
             "padding",
             default=0,
             min_value=0,
+            max_value=MAX_PADDING,
         )
         box_size = _parse_int(
             request.form.get("box_size"),
@@ -163,11 +175,27 @@ def api_batch() -> Response:
     if not _PREFIX_RE.match(prefix):
         return (
             jsonify(
-                {"error": "prefix may only contain letters, digits, '_' and '-'"}
+                {
+                    "error": (
+                        "prefix may only contain letters, digits, "
+                        "'_', '-', '.', or space, and may not start with '.'"
+                    )
+                }
             ),
             400,
         )
     data_template = request.form.get("data_template") or "{n}"
+    if len(data_template) > MAX_DATA_LENGTH:
+        return (
+            jsonify(
+                {
+                    "error": (
+                        f"data_template must be <= {MAX_DATA_LENGTH} characters"
+                    )
+                }
+            ),
+            400,
+        )
 
     raw_label_template = request.form.get("label_template")
     if raw_label_template is None:
@@ -176,6 +204,17 @@ def api_batch() -> Response:
         label_template = None
     else:
         label_template = raw_label_template
+    if label_template is not None and len(label_template) > MAX_DATA_LENGTH:
+        return (
+            jsonify(
+                {
+                    "error": (
+                        f"label_template must be <= {MAX_DATA_LENGTH} characters"
+                    )
+                }
+            ),
+            400,
+        )
 
     fmt = (request.form.get("format") or "zip").strip().lower()
     if fmt not in {"zip", "pdf"}:
@@ -203,14 +242,19 @@ def api_batch() -> Response:
         border=border,
     )
 
-    if fmt == "pdf":
-        payload = images_to_pdf(items)
-        mimetype = "application/pdf"
-        filename = f"qr_batch_{first_n}_{last_n}.pdf"
-    else:
-        payload = images_to_zip(items)
-        mimetype = "application/zip"
-        filename = f"qr_batch_{first_n}_{last_n}.zip"
+    try:
+        if fmt == "pdf":
+            payload = images_to_pdf(items)
+            mimetype = "application/pdf"
+            filename = f"qr_batch_{first_n}_{last_n}.pdf"
+        else:
+            payload = images_to_zip(items)
+            mimetype = "application/zip"
+            filename = f"qr_batch_{first_n}_{last_n}.zip"
+    except ValueError as exc:
+        # ``qrcode`` raises ValueError when a substituted template
+        # overflows QR version 40 capacity. Surface as a 400.
+        return jsonify({"error": f"batch could not be encoded: {exc}"}), 400
 
     return send_file(
         io.BytesIO(payload),

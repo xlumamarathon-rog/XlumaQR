@@ -14,6 +14,13 @@ python app.py
 
 Then open [http://127.0.0.1:5000](http://127.0.0.1:5000) in a browser.
 
+> **Deployment note:** XlumaQR is a localhost developer tool. The bundled
+> `app.py` binds to `127.0.0.1:5000` on purpose and ships with no
+> authentication or rate limiting. Do not expose it on the public
+> internet via `--host=0.0.0.0`, a reverse proxy, or a tunnel without
+> putting auth in front of it; the batch endpoint will happily render
+> thousands of QR codes for any caller that can reach the port.
+
 The page has two tabs: **Single QR** and **Sequential Batch**.
 
 ## Single QR
@@ -53,7 +60,11 @@ Form fields:
 - `padding` (default 0): minimum width of the numeric string. With
   `padding=3` the numbers become `001`, `002`, ...
 - `prefix` (default empty): filename prefix. With `prefix=qr_` the
-  archive contains `qr_101.png`, `qr_102.png`, ...
+  archive contains `qr_101.png`, `qr_102.png`, ... To keep ZIP entries
+  safe, the prefix is restricted to letters, digits, `_`, `-`, `.`, and
+  spaces, and may not start with `.` (so `inv.001-`, `tickets.`, and
+  `2026 batch ` are accepted; `../`, `.hidden`, and `a/b` are rejected
+  with a 400).
 - `data_template` (default `{n}`): template for the encoded data.
   `{n}` is replaced by the padded numeric string.
 - `label_template` (default `{n}`): template for the printed label.

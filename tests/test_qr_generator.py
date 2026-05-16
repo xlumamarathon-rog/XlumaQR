@@ -139,7 +139,14 @@ def test_compute_range_end_span_above_max_raises() -> None:
 def test_generate_sequence_template_with_unknown_placeholder_is_literal() -> None:
     """Issues 1 & 2: templates use ``str.replace`` so ``{m}`` is literal text,
     not a ``KeyError``, and attribute walks like ``{n.__class__}`` do not
-    perform attribute access."""
+    perform attribute access.
+
+    The image bytes for the substituted template must match the bytes
+    produced by ``generate_qr`` called directly with the literal payload
+    we expect after substitution. If a regression replaced ``str.replace``
+    with ``str.format`` (or with a smarter template engine), the encoded
+    payload would differ and these byte streams would no longer match.
+    """
     items = list(
         generate_sequence(
             start=1,
@@ -148,13 +155,22 @@ def test_generate_sequence_template_with_unknown_placeholder_is_literal() -> Non
             label_template=None,
         )
     )
-    # The function should not have raised. We cannot easily decode the QR
-    # back to its payload without an extra dep, but we can at least verify
-    # one image came back successfully.
     assert len(items) == 1
     name, image = items[0]
     assert name == "1.png"
     assert isinstance(image, Image.Image)
+
+    # Independently render what the encoded payload should be: ``{n}``
+    # is replaced by the padded number, but ``{m}`` and ``{n.__class__}``
+    # remain literal text.
+    expected_payload = "prefix-{m}-1-{n.__class__}"
+    expected = generate_qr(expected_payload)
+
+    actual_buf = io.BytesIO()
+    image.save(actual_buf, format="PNG")
+    expected_buf = io.BytesIO()
+    expected.save(expected_buf, format="PNG")
+    assert actual_buf.getvalue() == expected_buf.getvalue()
 
 
 def test_generate_sequence_label_template_with_unknown_placeholder_is_literal() -> None:
