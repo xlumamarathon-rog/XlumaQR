@@ -53,6 +53,17 @@ __all__ = [
 ]
 
 
+# Sensible upper bounds for inputs that flow in from untrusted callers
+# (e.g. an HTTP form). These are advisory: the core enforces ``MAX_RANGE_SIZE``
+# in :func:`compute_range` so an unwary caller cannot accidentally materialise
+# millions of strings, but the rest are exposed as constants so the HTTP
+# layer can validate before invoking us.
+MAX_RANGE_SIZE = 5000
+MAX_DATA_LENGTH = 4000
+MAX_BOX_SIZE = 50
+MAX_BORDER = 16
+
+
 def generate_qr(
     data: str,
     label: str | None = None,
@@ -177,11 +188,15 @@ def compute_range(
     if count is not None:
         if count <= 0:
             raise ValueError("count must be > 0")
+        if count > MAX_RANGE_SIZE:
+            raise ValueError(f"count must be <= {MAX_RANGE_SIZE}")
         last_exclusive = start + count
     else:
         assert end is not None  # narrow for type checkers
         if end < start:
             raise ValueError("end must be >= start")
+        if (end - start + 1) > MAX_RANGE_SIZE:
+            raise ValueError(f"range size must be <= {MAX_RANGE_SIZE}")
         last_exclusive = end + 1
 
     if padding > 0:
@@ -202,16 +217,22 @@ def generate_sequence(
 ) -> Iterator[tuple[str, Image.Image]]:
     """Yield ``(filename, PIL.Image.Image)`` pairs for a sequential range.
 
-    Both ``data_template`` and ``label_template`` receive a single
-    placeholder ``{n}`` which is the *padded* numeric string for that
-    item. Pass ``label_template=None`` to disable the printed label.
+    Both ``data_template`` and ``label_template`` are treated as literal
+    strings with the substring ``{n}`` replaced by the *padded* numeric
+    string for that item. We deliberately use :py:meth:`str.replace`
+    rather than :py:meth:`str.format` so user-supplied templates cannot
+    raise on stray braces and cannot perform attribute access (e.g.
+    ``{n.__class__}``) into a Python object. Templates that do not
+    contain ``{n}`` are emitted verbatim.
+
+    Pass ``label_template=None`` to disable the printed label.
 
     The emitted filename is ``f"{prefix}{padded_n}.png"``.
     """
     numbers = compute_range(start, count=count, end=end, padding=padding)
     for n in numbers:
-        data = data_template.format(n=n)
-        label = label_template.format(n=n) if label_template is not None else None
+        data = data_template.replace("{n}", n)
+        label = label_template.replace("{n}", n) if label_template is not None else None
         image = generate_qr(
             data,
             label=label,

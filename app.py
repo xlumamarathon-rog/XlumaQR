@@ -10,11 +10,15 @@ spinning up a server.
 from __future__ import annotations
 
 import io
+import re
 from typing import Any
 
 from flask import Flask, Response, jsonify, render_template, request, send_file
 
 from qr_generator import (
+    MAX_BORDER,
+    MAX_BOX_SIZE,
+    MAX_DATA_LENGTH,
     compute_range,
     generate_qr,
     generate_sequence,
@@ -24,12 +28,25 @@ from qr_generator import (
 
 app = Flask(__name__)
 
+# ``prefix`` is concatenated unmodified into ZIP entry names. Restrict it
+# to a conservative set so a hostile caller cannot sneak path separators,
+# NULs, or leading dots into the archive.
+_PREFIX_RE = re.compile(r"^[A-Za-z0-9_-]*$")
 
-def _parse_int(value: Any, field: str, *, default: int | None = None) -> int | None:
+
+def _parse_int(
+    value: Any,
+    field: str,
+    *,
+    default: int | None = None,
+    min_value: int | None = None,
+    max_value: int | None = None,
+) -> int | None:
     """Coerce a form value to int, returning ``default`` when blank/missing.
 
     Raises ``ValueError`` with a human-friendly message when the value is
-    present but not a valid integer.
+    present but not a valid integer, or falls outside ``[min_value,
+    max_value]`` when those bounds are supplied.
     """
     if value is None:
         return default
@@ -37,13 +54,20 @@ def _parse_int(value: Any, field: str, *, default: int | None = None) -> int | N
         if value.strip() == "":
             return default
         try:
-            return int(value.strip())
+            parsed = int(value.strip())
         except ValueError as exc:
             raise ValueError(f"{field} must be an integer") from exc
-    try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field} must be an integer") from exc
+    else:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} must be an integer") from exc
+
+    if min_value is not None and parsed < min_value:
+        raise ValueError(f"{field} must be >= {min_value}")
+    if max_value is not None and parsed > max_value:
+        raise ValueError(f"{field} must be <= {max_value}")
+    return parsed
 
 
 @app.route("/", methods=["GET"])
@@ -58,17 +82,32 @@ def api_single() -> Response:
     data = request.form.get("data", "").strip()
     if not data:
         return jsonify({"error": "data is required"}), 400
+    if len(data) > MAX_DATA_LENGTH:
+        return jsonify({"error": f"data must be <= {MAX_DATA_LENGTH} characters"}), 400
 
     label = request.form.get("label")
     if label is not None and label == "":
         label = None
 
     try:
-        box_size = _parse_int(request.form.get("box_size"), "box_size", default=10) or 10
-        border = _parse_int(request.form.get("border"), "border", default=4) or 4
+        box_size = _parse_int(
+            request.form.get("box_size"),
+            "box_size",
+            default=10,
+            min_value=1,
+            max_value=MAX_BOX_SIZE,
+        )
+        border = _parse_int(
+            request.form.get("border"),
+            "border",
+            default=4,
+            min_value=0,
+            max_value=MAX_BORDER,
+        )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
+    assert box_size is not None and border is not None  # defaults guarantee non-None
     image = generate_qr(data, label=label, box_size=box_size, border=border)
     buf = io.BytesIO()
     image.save(buf, format="PNG")
@@ -90,11 +129,30 @@ def api_batch() -> Response:
             raise ValueError("start is required")
         count = _parse_int(request.form.get("count"), "count")
         end = _parse_int(request.form.get("end"), "end")
-        padding = _parse_int(request.form.get("padding"), "padding", default=0) or 0
-        box_size = _parse_int(request.form.get("box_size"), "box_size", default=10) or 10
-        border = _parse_int(request.form.get("border"), "border", default=4) or 4
+        padding = _parse_int(
+            request.form.get("padding"),
+            "padding",
+            default=0,
+            min_value=0,
+        )
+        box_size = _parse_int(
+            request.form.get("box_size"),
+            "box_size",
+            default=10,
+            min_value=1,
+            max_value=MAX_BOX_SIZE,
+        )
+        border = _parse_int(
+            request.form.get("border"),
+            "border",
+            default=4,
+            min_value=0,
+            max_value=MAX_BORDER,
+        )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+
+    assert padding is not None and box_size is not None and border is not None
 
     if count is None and end is None:
         return jsonify({"error": "exactly one of count or end is required"}), 400
@@ -102,6 +160,13 @@ def api_batch() -> Response:
         return jsonify({"error": "provide only one of count or end, not both"}), 400
 
     prefix = request.form.get("prefix", "")
+    if not _PREFIX_RE.match(prefix):
+        return (
+            jsonify(
+                {"error": "prefix may only contain letters, digits, '_' and '-'"}
+            ),
+            400,
+        )
     data_template = request.form.get("data_template") or "{n}"
 
     raw_label_template = request.form.get("label_template")
@@ -123,6 +188,7 @@ def api_batch() -> Response:
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
+    first_n = numbers[0]
     last_n = numbers[-1]
 
     items = generate_sequence(
@@ -140,11 +206,11 @@ def api_batch() -> Response:
     if fmt == "pdf":
         payload = images_to_pdf(items)
         mimetype = "application/pdf"
-        filename = f"qr_batch_{start}_{last_n}.pdf"
+        filename = f"qr_batch_{first_n}_{last_n}.pdf"
     else:
         payload = images_to_zip(items)
         mimetype = "application/zip"
-        filename = f"qr_batch_{start}_{last_n}.zip"
+        filename = f"qr_batch_{first_n}_{last_n}.zip"
 
     return send_file(
         io.BytesIO(payload),

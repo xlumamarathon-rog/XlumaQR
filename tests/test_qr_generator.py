@@ -115,3 +115,61 @@ def test_images_to_pdf_returns_pdf_bytes() -> None:
     pdf_bytes = images_to_pdf(items)
     assert pdf_bytes.startswith(b"%PDF-")
     assert len(pdf_bytes) > 1024
+
+
+# --- Hardening regression tests (semantic-review v1) ----------------
+
+
+def test_compute_range_count_above_max_raises() -> None:
+    """Issue 3: ``count`` is bounded by ``MAX_RANGE_SIZE``."""
+    from qr_generator import MAX_RANGE_SIZE
+
+    with pytest.raises(ValueError):
+        compute_range(0, count=MAX_RANGE_SIZE + 1)
+
+
+def test_compute_range_end_span_above_max_raises() -> None:
+    """Issue 3: ``end - start + 1`` is bounded by ``MAX_RANGE_SIZE``."""
+    from qr_generator import MAX_RANGE_SIZE
+
+    with pytest.raises(ValueError):
+        compute_range(1, end=MAX_RANGE_SIZE + 1)
+
+
+def test_generate_sequence_template_with_unknown_placeholder_is_literal() -> None:
+    """Issues 1 & 2: templates use ``str.replace`` so ``{m}`` is literal text,
+    not a ``KeyError``, and attribute walks like ``{n.__class__}`` do not
+    perform attribute access."""
+    items = list(
+        generate_sequence(
+            start=1,
+            count=1,
+            data_template="prefix-{m}-{n}-{n.__class__}",
+            label_template=None,
+        )
+    )
+    # The function should not have raised. We cannot easily decode the QR
+    # back to its payload without an extra dep, but we can at least verify
+    # one image came back successfully.
+    assert len(items) == 1
+    name, image = items[0]
+    assert name == "1.png"
+    assert isinstance(image, Image.Image)
+
+
+def test_generate_sequence_label_template_with_unknown_placeholder_is_literal() -> None:
+    """Issues 1 & 2: same protection applies to ``label_template``."""
+    items = list(
+        generate_sequence(
+            start=1,
+            count=1,
+            data_template="{n}",
+            label_template="L-{m}-{n}",
+        )
+    )
+    assert len(items) == 1
+    name, image = items[0]
+    assert name == "1.png"
+    # The labelled image must be taller than a bare QR (label band added).
+    bare = generate_qr("1")
+    assert image.size[1] > bare.size[1]
