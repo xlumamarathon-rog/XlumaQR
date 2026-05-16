@@ -13,6 +13,7 @@ import base64
 import io
 import json
 import re
+import warnings
 from typing import Any, Iterator
 
 from flask import Flask, Response, jsonify, render_template, request, send_file, stream_with_context
@@ -141,14 +142,30 @@ def _load_logo_from_request() -> Image.Image | None:
        :meth:`PIL.Image.Image.verify`, which validates the magic bytes
        match a real image. ``verify()`` consumes the image object, so
        the bytes are reopened afterwards for further inspection.
-    3. Only PNG and JPEG images are accepted. Anything else (SVG,
-       BMP, GIF, WEBP, etc.) raises ``"logo must be PNG or JPEG"``.
-    4. Either dimension exceeding :data:`qr_generator.MAX_LOGO_DIMENSION`
-       raises ``"logo dimensions too large"``.
+    3. The lazy :func:`PIL.Image.open` exposes ``image.size`` *without*
+       allocating the full bitmap. Either dimension exceeding
+       :data:`qr_generator.MAX_LOGO_DIMENSION` raises
+       ``"logo dimensions too large"`` *before* :meth:`Image.load` runs,
+       so a small-on-the-wire / huge-when-decoded PNG (a "decompression
+       bomb": a 12000x12000 single-colour PNG fits comfortably under
+       the 2 MiB byte cap but would allocate ~432 MB of RGB bitmap on
+       decode) can never exhaust memory on the way to the dimension
+       check. PIL's built-in :class:`PIL.Image.DecompressionBombWarning`
+       only fires above ~89 MP and is a warning, not an exception, so
+       we cannot rely on it.
+    4. Only PNG and JPEG images are accepted. Anything else (SVG, BMP,
+       GIF, WEBP, etc.) raises ``"logo must be PNG or JPEG"``.
 
     PIL's :class:`PIL.UnidentifiedImageError` (raised when a non-image
-    file is uploaded with a fake mime type, e.g. a text file) is caught
-    and turned into ``ValueError("logo could not be decoded")``.
+    file is uploaded with a fake mime type, e.g. a text file) and the
+    grab-bag of decode-time errors PIL raises on malformed input
+    (``OSError``, ``SyntaxError``, ``ValueError``) are caught and turned
+    into ``ValueError("logo could not be decoded")``. ``MemoryError``
+    is deliberately *not* caught here so an out-of-memory decode
+    (which can no longer be triggered through this validator now that
+    the dimension check runs first, but could conceivably surface from
+    a pathological PIL bug) propagates as a real failure rather than
+    being masked as a generic 400.
     """
     upload = request.files.get("logo")
     if upload is None or not getattr(upload, "filename", ""):
@@ -163,34 +180,57 @@ def _load_logo_from_request() -> Image.Image | None:
     # First pass: ``verify()`` confirms the magic bytes match a real
     # image without decoding the full bitmap. It also consumes the
     # image object, so we re-open the bytes for further inspection.
+    # We silence PIL's ``DecompressionBombWarning`` here: it fires on
+    # large headers (above ~89 MP) but is informational, not an error.
+    # Our own ``MAX_LOGO_DIMENSION`` cap below is the authoritative
+    # bound and rejects anything we deem too large.
     try:
-        probe = Image.open(io.BytesIO(raw))
-        probe.verify()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            probe = Image.open(io.BytesIO(raw))
+            probe.verify()
     except UnidentifiedImageError as exc:
         raise ValueError("logo could not be decoded") from exc
-    except Exception as exc:
+    except (OSError, SyntaxError, ValueError) as exc:
         # PIL raises a grab-bag of exceptions on malformed input
-        # (SyntaxError, OSError, ValueError, ...). Normalise them all
-        # to a clean ValueError so the HTTP layer returns 400.
+        # (SyntaxError on truncated headers, OSError on broken streams,
+        # ValueError on other malformed input). Normalise them to a
+        # ValueError so the HTTP layer returns 400. ``MemoryError`` and
+        # any unexpected ``Exception`` propagate.
         raise ValueError("logo could not be decoded") from exc
 
+    # Second pass: open lazily so ``image.size`` is available without
+    # decoding the full bitmap. Reject oversized dimensions *before*
+    # calling ``load()`` so a decompression-bomb upload (small on the
+    # wire, huge on decode) is rejected before allocating the bitmap.
     try:
-        image = Image.open(io.BytesIO(raw))
-        image.load()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            image = Image.open(io.BytesIO(raw))
     except UnidentifiedImageError as exc:
         raise ValueError("logo could not be decoded") from exc
-    except Exception as exc:
+    except (OSError, SyntaxError, ValueError) as exc:
         raise ValueError("logo could not be decoded") from exc
-
-    fmt = (image.format or "").upper()
-    if fmt not in {"PNG", "JPEG"}:
-        raise ValueError("logo must be PNG or JPEG")
 
     width, height = image.size
     if width > MAX_LOGO_DIMENSION or height > MAX_LOGO_DIMENSION:
         raise ValueError(
             f"logo dimensions too large (max {MAX_LOGO_DIMENSION}x{MAX_LOGO_DIMENSION})"
         )
+
+    # Now that the dimension cap has bounded the worst-case bitmap to
+    # ``MAX_LOGO_DIMENSION**2 * 4`` bytes (~4 MB at the 1024 cap with
+    # an RGBA decode), decode the bitmap.
+    try:
+        image.load()
+    except UnidentifiedImageError as exc:
+        raise ValueError("logo could not be decoded") from exc
+    except (OSError, SyntaxError, ValueError) as exc:
+        raise ValueError("logo could not be decoded") from exc
+
+    fmt = (image.format or "").upper()
+    if fmt not in {"PNG", "JPEG"}:
+        raise ValueError("logo must be PNG or JPEG")
 
     return image
 

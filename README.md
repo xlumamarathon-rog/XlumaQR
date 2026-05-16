@@ -217,6 +217,17 @@ all accept two optional fields that style the rendered QR codes:
     PIL `Image.verify` plus `Image.format`, so a renamed `.txt`
     pretending to be `image/png` is caught)
 
+  The dimension cap is also what bounds the decoded bitmap. A
+  pathologically compressible PNG (a single-colour 12000x12000 image
+  is well under the 2 MB byte cap on the wire but would decode to
+  ~432 MB of RGB pixels) is rejected on its declared header
+  dimensions *before* PIL allocates the bitmap, so a
+  decompression-bomb upload cannot exhaust the Lambda's memory on the
+  way to the dimension check. Worst-case decoded memory for any
+  upload that passes validation is therefore roughly
+  `MAX_LOGO_DIMENSION**2 * 4` bytes (~4 MB at the 1024 cap with an
+  RGBA decode).
+
 When a logo is supplied, the encoder is bumped to error-correction
 level H (15-30% recovery, vs M's 15%) so the QR stays scannable with
 the centre region partially obscured. The trade-off is that QR version

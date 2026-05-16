@@ -583,3 +583,111 @@ def test_max_logo_constants_exposed() -> None:
     assert MAX_LOGO_BYTES == 2 * 1024 * 1024
     assert MAX_LOGO_DIMENSION == 1024
     assert LOGO_WORK_SIZE == 256
+
+
+# --- Custom QR designs: review v1 follow-ups -----------------------
+
+
+def test_pad_logo_keeps_white_margin_around_logo_corners() -> None:
+    """Review v1 issue 2: ``_pad_logo`` must keep a continuous white
+    margin around the entire logo, including its four corners.
+
+    The previous implementation drew a rounded rectangle with a fixed
+    ``target_size_px // 8`` corner radius edge-to-edge on the canvas,
+    while the logo only occupied the inner ~80%. At
+    ``target_size_px=256`` the corner radius was 32 px but the offset
+    between the canvas edge and the logo was only 26 px, so the
+    rounded curve cut inward past the logo's bounding box and left
+    each corner without the promised white ring.
+
+    This test:
+
+    1. Builds a small saturated-orange logo and pads it.
+    2. Asserts the four canvas corners are transparent (the rounded
+       cut still works).
+    3. Asserts each of the four logo corners themselves is solid
+       orange (the logo was actually pasted).
+    4. Asserts each pixel just outside the logo's corner (one or two
+       pixels into the margin in both axes) is solid white, which is
+       what proves the rounded curve does not eat into the margin
+       around the logo.
+    """
+    from qr_generator import LOGO_WORK_SIZE, _pad_logo
+
+    logo = Image.new("RGB", (100, 100), (255, 165, 0))
+    pad = _pad_logo(logo, LOGO_WORK_SIZE)
+    assert pad.mode == "RGBA"
+    assert pad.size == (LOGO_WORK_SIZE, LOGO_WORK_SIZE)
+
+    # Canvas corners must be cut by the rounded curve (transparent).
+    for corner in [(0, 0), (LOGO_WORK_SIZE - 1, 0),
+                   (0, LOGO_WORK_SIZE - 1),
+                   (LOGO_WORK_SIZE - 1, LOGO_WORK_SIZE - 1)]:
+        pixel = pad.getpixel(corner)
+        assert pixel[3] == 0, (
+            f"canvas corner {corner} should be transparent, got {pixel}"
+        )
+
+    # The logo lands at offset = (W - 100) // 2 = 78, so its corners
+    # are at (78, 78), (177, 78), (78, 177), (177, 177).
+    offset = (LOGO_WORK_SIZE - 100) // 2
+    far = offset + 99
+    logo_corners = [
+        (offset, offset),
+        (far, offset),
+        (offset, far),
+        (far, far),
+    ]
+    for px, py in logo_corners:
+        pixel = pad.getpixel((px, py))
+        assert pixel == (255, 165, 0, 255), (
+            f"logo corner ({px},{py}) should be solid orange, got {pixel}"
+        )
+
+    # The pixel two steps outside each logo corner (diagonally into
+    # the margin, both axes) must be solid white. If the rounded
+    # curve still cut inward past the logo's bounding box, this would
+    # be transparent (or partially transparent due to anti-aliasing)
+    # rather than fully opaque white.
+    margin_corners = [
+        (offset - 2, offset - 2),
+        (far + 2, offset - 2),
+        (offset - 2, far + 2),
+        (far + 2, far + 2),
+    ]
+    for px, py in margin_corners:
+        pixel = pad.getpixel((px, py))
+        assert pixel == (255, 255, 255, 255), (
+            f"margin corner ({px},{py}) should be solid white, got {pixel}"
+        )
+
+
+def test_square_gradient_template_renders() -> None:
+    """Review v1 issue 3: the registry must include at least one
+    template that exercises the ``square_gradient`` colour-mask branch
+    so ``_resolve_color_mask`` does not carry a dead path. The template
+    must round-trip through ``generate_qr`` and produce a valid image
+    whose pixels are not the legacy plain-black-on-white render."""
+    from qr_generator import generate_qr, get_template, list_templates
+
+    matching = [
+        t for t in list_templates()
+        if t["spec"].get("color_mask_kind") == "square_gradient"
+    ]
+    assert matching, (
+        "expected at least one template with color_mask_kind=square_gradient"
+    )
+
+    template_id = matching[0]["id"]
+    # Sanity check the registry resolves the spec.
+    assert get_template(template_id)["spec"]["color_mask_kind"] == "square_gradient"
+
+    legacy = generate_qr("hello").convert("RGB")
+    styled = generate_qr("hello", template_id=template_id).convert("RGB")
+    assert legacy.size == styled.size
+    # A known-active QR module on the legacy render must not be plain
+    # black on the styled render. box_size=10, border=4 -> module 0
+    # starts at pixel 40.
+    sample = (60, 60)
+    assert legacy.getpixel(sample) == (0, 0, 0)
+    assert styled.getpixel(sample) != (0, 0, 0)

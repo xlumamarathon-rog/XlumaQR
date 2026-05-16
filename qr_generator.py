@@ -466,6 +466,18 @@ TEMPLATES: list[dict] = [
             "front_color": (55, 71, 79),
         },
     },
+    {
+        "id": "business-square-frame",
+        "name": "Business - Square Frame",
+        "category": "business",
+        "spec": {
+            "module_drawer_kind": "rounded",
+            "color_mask_kind": "square_gradient",
+            "back_color": (255, 255, 255),
+            "center_color": (55, 71, 79),
+            "edge_color": (13, 71, 161),
+        },
+    },
     # --- event (3) -------------------------------------------------------
     {
         "id": "event-festival",
@@ -727,27 +739,45 @@ def _pad_logo(logo: Image.Image, target_size_px: int) -> Image.Image:
     about 80% of that area centred inside it, and returns the result
     as an RGBA image. The 80% pad leaves a small white margin on every
     side, which is what keeps the QR scannable.
+
+    The corner radius is capped to be strictly less than the offset
+    between the canvas edge and the logo's bounding box so the rounded
+    corner stays in the white margin and never cuts past the logo's
+    outer edge. A naive fixed ``target_size_px // 8`` radius can eat
+    inward past the logo's corners when the logo fills the inner 80%
+    of the pad (offsets ~26 px at ``target_size_px=256`` while the
+    fixed radius would be 32 px), which would leave the logo's corners
+    unprotected by the white ring.
     """
     if target_size_px <= 0:
         raise ValueError("target_size_px must be > 0")
 
-    # Build the white rounded-square pad as the base canvas.
+    # Fit the logo into ~80% of the pad while preserving aspect ratio.
+    # We need to know the actual placed offsets before drawing the
+    # rounded rectangle so the corner radius can be capped inside the
+    # margin.
+    inner = max(1, int(target_size_px * 0.80))
+    work = logo.convert("RGBA").copy()
+    work.thumbnail((inner, inner), Image.LANCZOS)
+    offset_x = (target_size_px - work.width) // 2
+    offset_y = (target_size_px - work.height) // 2
+
+    # Build the white rounded-square pad as the base canvas. The corner
+    # radius is capped below the smallest offset so the rounded curve
+    # stays strictly inside the margin and the logo's bounding box is
+    # entirely surrounded by solid white. ``- 2`` keeps a one-pixel
+    # white sliver between the rounded edge and the logo perimeter so
+    # PIL's anti-aliased curve cannot brush against the logo border.
+    margin_cap = max(2, min(offset_x, offset_y) - 2)
+    radius = max(2, min(target_size_px // 8, margin_cap))
     pad = Image.new("RGBA", (target_size_px, target_size_px), (0, 0, 0, 0))
     draw = ImageDraw.Draw(pad)
-    radius = max(2, target_size_px // 8)
     draw.rounded_rectangle(
         [(0, 0), (target_size_px - 1, target_size_px - 1)],
         radius=radius,
         fill=(255, 255, 255, 255),
     )
 
-    # Fit the logo into ~80% of the pad while preserving aspect ratio.
-    inner = max(1, int(target_size_px * 0.80))
-    work = logo.convert("RGBA").copy()
-    work.thumbnail((inner, inner), Image.LANCZOS)
-
-    offset_x = (target_size_px - work.width) // 2
-    offset_y = (target_size_px - work.height) // 2
     pad.paste(work, (offset_x, offset_y), mask=work)
     return pad
 

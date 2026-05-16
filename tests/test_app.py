@@ -988,3 +988,137 @@ def test_batch_stream_with_template_emits_styled_payload(client) -> None:
         assert plain[name] != styled[name], (
             f"entry {name} did not get styled in the streaming path"
         )
+
+
+# --- Custom QR designs: review v1 follow-ups ------------------------
+
+
+def test_single_logo_decompression_bomb_returns_400_without_oom(client) -> None:
+    """Review v1 issue 1: a small-on-the-wire / huge-when-decoded PNG
+    must be rejected on its declared header dimensions *before* PIL
+    allocates the bitmap.
+
+    A 12000x12000 single-channel PNG fits comfortably under
+    ``MAX_LOGO_BYTES`` (a few hundred KB) but would decode to 144 MP.
+    PIL's built-in :class:`PIL.Image.DecompressionBombWarning` only
+    fires above ~89 MP and is a *warning*, not an exception, so the
+    validator cannot rely on it. The fix is to read ``Image.size``
+    from the lazy ``Image.open()`` (which does not allocate the
+    bitmap) and reject oversized dimensions before calling
+    ``Image.load``.
+
+    The test asserts two things:
+
+    1. The validator returns a clean 400 with the *dimension* error
+       message (not a generic decode error). If the validator
+       regressed to calling ``load()`` first the request would still
+       eventually error out with the dimension message, but only
+       after allocating the bitmap.
+    2. The handler completes quickly. Lazy ``Image.open()`` reads the
+       PNG header in microseconds; calling ``load()`` on a 144 MP
+       single-channel PNG decodes the full bitmap which takes hundreds
+       of milliseconds even on a fast box. We give a generous timing
+       budget so this remains reliable on slow CI, but a regression
+       to the load-before-check order would blow well past it.
+    """
+    import time
+    import warnings
+
+    from PIL import Image as _Image
+
+    # PIL warns above ~89 MP - the warning is informational and we want
+    # to build the bytes without flooding pytest with a warning line.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", _Image.DecompressionBombWarning)
+        bomb = _Image.new("L", (12000, 12000), 255)
+        buf = io.BytesIO()
+        bomb.save(buf, format="PNG", optimize=True)
+    raw = buf.getvalue()
+    # Sanity check: the bytes really do fit under the byte cap.
+    from qr_generator import MAX_LOGO_BYTES as _MAX
+
+    assert len(raw) < _MAX, (
+        f"bomb is {len(raw)} bytes, expected to fit under {_MAX}"
+    )
+
+    t0 = time.perf_counter()
+    rv = client.post(
+        "/api/qr/single",
+        data={
+            "data": "hello",
+            "logo": (io.BytesIO(raw), "bomb.png", "image/png"),
+        },
+        content_type="multipart/form-data",
+    )
+    elapsed = time.perf_counter() - t0
+    assert rv.status_code == 400, rv.data
+    body = rv.get_json()
+    assert body is not None and "error" in body
+    # Must be the dimension-cap error, not a generic decode error: that
+    # is what proves the lazy-size check ran before ``load()``.
+    assert "dimension" in body["error"].lower(), body["error"]
+    # Loose timing budget: a lazy header read is microseconds; a load()
+    # of a 144 MP single-channel PNG takes hundreds of milliseconds
+    # even on fast hardware. 1 second is generous enough for slow CI
+    # while still catching a regression to load-before-check.
+    assert elapsed < 1.0, (
+        f"validator took {elapsed:.3f}s on a 12000x12000 PNG; "
+        "this suggests Image.load() ran before the dimension check"
+    )
+
+
+def test_batch_stream_logo_overflow_emits_error_event(client) -> None:
+    """Review v1 issue 6: when a logo bumps error correction to H and
+    the payload exceeds H-mode capacity, the streaming endpoint must
+    surface the encoder ``ValueError`` as a terminal ``error`` NDJSON
+    event with HTTP 200, mirroring the synchronous endpoint's clean
+    400. The synchronous path is already covered by
+    ``test_single_logo_plus_oversized_payload_returns_400``; this test
+    asserts the streaming path applies the same translation."""
+    import base64 as _b64
+    import json as _json
+
+    logo_bytes = _orange_logo_bytes()
+    # 'A' * 2000 fits at M (no logo) and overflows at H (with a logo),
+    # so the encoder raises ValueError on the first item of the batch.
+    rv = client.post(
+        "/api/qr/batch/stream",
+        data={
+            "start": "1",
+            "count": "2",
+            "format": "zip",
+            "data_template": "A" * 2000,
+            "label_template": "",
+            "logo": (io.BytesIO(logo_bytes), "logo.png", "image/png"),
+        },
+        content_type="multipart/form-data",
+    )
+    # Status remains 200 because validation passed and streaming began
+    # before the ValueError was raised.
+    assert rv.status_code == 200, rv.data
+    assert rv.content_type.startswith("application/x-ndjson")
+
+    events = []
+    for line in rv.get_data().split(b"\n"):
+        if line:
+            events.append(_json.loads(line.decode("utf-8")))
+    # ``start`` event was emitted before the encoder failed.
+    assert events[0]["event"] == "start"
+    # The terminal event must be ``error``, never ``result``.
+    terminal = events[-1]
+    assert terminal["event"] == "error"
+    assert "could not be encoded" in terminal["error"]
+    # No ``result`` event was emitted.
+    assert all(evt.get("event") != "result" for evt in events)
+
+
+def test_get_template_preview_square_gradient_renders(client) -> None:
+    """Review v1 issue 3: the registry now ships a template that
+    actually exercises the ``square_gradient`` colour-mask branch, so
+    ``_resolve_color_mask`` no longer has a dead branch. The preview
+    endpoint exercises the full render path end-to-end."""
+    rv = client.get("/api/qr/templates/business-square-frame/preview")
+    assert rv.status_code == 200
+    assert rv.mimetype == "image/png"
+    assert rv.data.startswith(PNG_MAGIC)
+
