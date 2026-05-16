@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import copy
 import io
+import os
 import zipfile
 from typing import Iterable, Iterator
 
@@ -138,6 +139,18 @@ MAX_LOGO_BYTES = 2 * 1024 * 1024
 MAX_LOGO_DIMENSION = 1024
 LOGO_HARD_MAX_DIMENSION = 4096
 LOGO_WORK_SIZE = 256
+
+
+# --- Label rendering -----------------------------------------------------
+#
+# The optional label drawn under a QR is rendered with a bundled
+# Plus Jakarta Sans Bold TrueType font for a clean, premium appearance.
+# The font is committed under ``static/fonts/`` next to its SIL OFL 1.1
+# licence, so no runtime download is required and the deployable
+# package stays self-contained.
+LABEL_FONT_PATH = os.path.join(
+    os.path.dirname(__file__), "static", "fonts", "PlusJakartaSans-Bold.ttf",
+)
 
 
 # --- Templates registry --------------------------------------------------
@@ -727,6 +740,50 @@ def _resolve_color_mask(spec: dict):
     raise ValueError(f"unknown color_mask_kind: {kind!r}")
 
 
+def _label_color_from_spec(spec: dict) -> tuple[int, int, int]:
+    """Return the representative foreground RGB for a template ``spec``.
+
+    The label band drawn under the QR uses this colour so the printed
+    text matches the QR's visual identity. Each ``color_mask_kind``
+    maps onto a single representative stop:
+
+    * ``solid`` -> ``front_color``
+    * ``radial_gradient`` -> ``center_color``
+    * ``square_gradient`` -> ``center_color``
+    * ``horizontal_gradient`` -> ``left_color``
+    * ``vertical_gradient`` -> ``top_color``
+
+    Raises :class:`ValueError` on an unknown ``color_mask_kind``,
+    mirroring the closed-set policy in :func:`_resolve_color_mask`.
+    """
+    kind = spec.get("color_mask_kind")
+    if kind == "solid":
+        return spec["front_color"]
+    if kind == "radial_gradient":
+        return spec["center_color"]
+    if kind == "square_gradient":
+        return spec["center_color"]
+    if kind == "horizontal_gradient":
+        return spec["left_color"]
+    if kind == "vertical_gradient":
+        return spec["top_color"]
+    raise ValueError(f"unknown color_mask_kind: {kind!r}")
+
+
+def _load_label_font(size_px: int):
+    """Return the bundled Plus Jakarta Sans Bold TTF at ``size_px``.
+
+    Falls back to :func:`PIL.ImageFont.load_default` only if PIL cannot
+    open the bundled file (``OSError``). The fallback is purely
+    defensive: the font ships with the source tree at
+    :data:`LABEL_FONT_PATH` so the truetype path is the expected one.
+    """
+    try:
+        return ImageFont.truetype(LABEL_FONT_PATH, size_px)
+    except OSError:
+        return ImageFont.load_default()
+
+
 def list_templates() -> list[dict]:
     """Return a defensive deep copy of the built-in :data:`TEMPLATES` list.
 
@@ -817,7 +874,7 @@ def generate_qr(
     template_id: str | None = None,
     logo: Image.Image | None = None,
 ) -> Image.Image:
-    """Render ``data`` as a QR code and optionally overlay a label on it.
+    """Render ``data`` as a QR code with an optional label band below.
 
     When neither ``template_id`` nor ``logo`` is supplied (the common
     case), the QR is built with :data:`qrcode.constants.ERROR_CORRECT_M`
@@ -834,23 +891,27 @@ def generate_qr(
     A payload that fits at M but exceeds the H-mode capacity will raise
     :class:`ValueError` from inside the underlying ``qrcode`` library.
 
-    The optional ``label`` is overlaid on top of the rendered QR via
-    :class:`PIL.ImageDraw.ImageDraw` exactly the same way for both the
-    legacy and the styled paths, so labels keep working on styled QRs.
+    When a ``label`` is supplied, the returned image is taller than the
+    bare QR by a clean white band that contains the label, drawn in the
+    template's foreground colour using the bundled Plus Jakarta Sans
+    Bold TrueType font (see :data:`LABEL_FONT_PATH`). The legacy plain
+    render path uses pure black for the label text.
 
     Parameters
     ----------
     data:
         Payload encoded into the QR code.
     label:
-        Optional text overlaid on the QR. ``None`` returns the bare QR.
+        Optional text drawn in a band below the QR. ``None`` returns the
+        bare QR.
     box_size:
         Pixel size of each QR module (passed through to ``qrcode``).
     border:
         Quiet-zone width in modules (passed through to ``qrcode``).
     label_height:
-        Height in pixels of the overlay badge. When ``None`` (the default),
-        a value proportional to the QR size is chosen.
+        Deprecated. Retained for backwards compatibility but ignored: the
+        band's height is now derived from the chosen font size, which
+        scales with the QR's pixel height.
     template_id:
         Optional template slug. ``None`` and ``"default"`` both take the
         legacy plain-black-on-white render path. Any other id is resolved
@@ -866,10 +927,12 @@ def generate_qr(
     Returns
     -------
     PIL.Image.Image
-        RGB image of the rendered QR (with label overlay, if provided).
+        RGB image of the rendered QR. When ``label`` is supplied the
+        image is taller than the bare QR by the height of the label band.
     """
     use_styled = not _is_default_template(template_id) or logo is not None
 
+    spec: dict | None = None
     if not use_styled:
         # --- Legacy fast path: byte-for-byte identical to earlier releases.
         qr = qrcode.QRCode(
@@ -911,51 +974,55 @@ def generate_qr(
         return qr_img
 
     qr_w, qr_h = qr_img.size
-    if label_height is None:
-        # Roughly 18% of the QR's height, with a sensible floor so the
-        # default bitmap font remains readable on small QRs.
-        label_height = max(24, qr_h // 6)
 
-    font = ImageFont.load_default()
+    # Choose a font size proportional to the QR's pixel height (~12%)
+    # with a floor that keeps the label legible on small renders.
+    font_size = max(14, qr_h * 12 // 100)
+    font = _load_label_font(font_size)
 
-    # Measure the label text.
-    draw = ImageDraw.Draw(qr_img)
+    # Measure the label text on a scratch ImageDraw so the canvas size
+    # below is sized to fit.
+    scratch = ImageDraw.Draw(qr_img)
     try:
-        bbox = draw.textbbox((0, 0), label, font=font)
+        bbox = scratch.textbbox((0, 0), label, font=font)
         text_w = bbox[2] - bbox[0]
         text_h = bbox[3] - bbox[1]
         text_offset_x = -bbox[0]
         text_offset_y = -bbox[1]
     except AttributeError:
         # Pillow < 9.2 fallback (kept for safety; modern Pillow has textbbox).
-        text_w, text_h = draw.textsize(label, font=font)  # type: ignore[attr-defined]
+        text_w, text_h = scratch.textsize(label, font=font)  # type: ignore[attr-defined]
         text_offset_x = 0
         text_offset_y = 0
 
-    # Draw a white badge at the bottom center of the QR, overlaid on the
-    # QR pattern. Add horizontal and vertical padding around the text.
-    pad_x = max(4, box_size)
-    pad_y = max(2, box_size // 2)
-    badge_w = text_w + 2 * pad_x
-    badge_h = text_h + 2 * pad_y
+    # Padding around the text in the band scales with the font size so
+    # the band breathes proportionally to the QR. ``pad_x`` is computed
+    # for parity with ``pad_y`` (the band would shrink to fit a wider
+    # label by the same logic on both axes); the band currently spans
+    # the full QR width, so the horizontal pad is informational only
+    # and the text is centred via ``(qr_w - text_w) // 2`` below.
+    pad_y = max(box_size, font_size // 2)
+    pad_x = max(box_size, font_size // 2)  # noqa: F841 - reserved for future side-aligned layouts
+    band_h = text_h + 2 * pad_y
 
-    badge_x = (qr_w - badge_w) // 2
-    badge_y = qr_h - badge_h - (border * box_size) // 2
+    # Determine the label foreground colour. The legacy render path
+    # uses plain black; templated renders pick the representative stop
+    # for the chosen colour mask so the label visually matches the QR.
+    if _is_default_template(template_id) or spec is None:
+        fg_color: tuple[int, int, int] = (0, 0, 0)
+    else:
+        fg_color = _label_color_from_spec(spec)
 
-    # Draw badge background (white rectangle)
-    draw.rectangle(
-        [badge_x, badge_y, badge_x + badge_w, badge_y + badge_h],
-        fill="white",
-        outline="black",
-        width=1,
-    )
+    # Build a fresh white canvas tall enough for the QR plus the band,
+    # paste the QR at the top, and draw the label centred in the band.
+    canvas = Image.new("RGB", (qr_w, qr_h + band_h), (255, 255, 255))
+    canvas.paste(qr_img, (0, 0))
+    draw = ImageDraw.Draw(canvas)
+    text_x = (qr_w - text_w) // 2 + text_offset_x
+    text_y = qr_h + pad_y + text_offset_y
+    draw.text((text_x, text_y), label, fill=fg_color, font=font)
 
-    # Draw label text centered in the badge
-    text_x = badge_x + pad_x + text_offset_x
-    text_y = badge_y + pad_y + text_offset_y
-    draw.text((text_x, text_y), label, fill="black", font=font)
-
-    return qr_img
+    return canvas
 
 
 def render_template_preview(template_id: str) -> bytes:

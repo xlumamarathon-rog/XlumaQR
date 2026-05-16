@@ -754,8 +754,14 @@ def _centre_pixel(png_bytes: bytes):
     from PIL import Image as _Image
 
     img = _Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    # The QR portion sits at the top of the image and is square; when a
+    # label band is rendered below it the overall image is taller than
+    # it is wide. Sampling the centre of the square QR portion (rather
+    # than the centre of the whole image) keeps this helper accurate
+    # whether or not the caller asked for a label.
+    qr_side = min(img.width, img.height)
     cx = img.width // 2
-    cy = img.height // 2
+    cy = qr_side // 2
     return img.getpixel((cx, cy))
 
 

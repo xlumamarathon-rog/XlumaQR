@@ -37,9 +37,11 @@ def test_generate_qr_with_label_increases_height_and_image_is_decodable_as_png_b
     bare = generate_qr("hello", box_size=10, border=4)
     labeled = generate_qr("hello", label="42", box_size=10, border=4)
 
-    # Label is now overlaid, so size stays the same.
-    assert labeled.size == bare.size
-    # The pixels must differ (the overlay badge is drawn on top of the QR).
+    # The labelled image is rendered with a clean band below the QR, so
+    # the width is preserved but the height grows by the band's height.
+    assert labeled.size[0] == bare.size[0]
+    assert labeled.size[1] > bare.size[1]
+    # The pixels must differ (the band below adds a new region).
     assert labeled.tobytes() != bare.tobytes()
 
     # Round-trip via PNG bytes to confirm the image is a real PNG.
@@ -186,10 +188,11 @@ def test_generate_sequence_label_template_with_unknown_placeholder_is_literal() 
     assert len(items) == 1
     name, image = items[0]
     assert name == "1.png"
-    # The labelled image has the same size as bare (overlay, not extension)
-    # but the pixel content must differ (proving the label badge was drawn).
+    # The labelled image keeps the bare QR's width but is taller by the
+    # band drawn below; the pixel content must differ (proving the band
+    # was actually drawn rather than the bare QR being returned).
     bare = generate_qr("1")
-    assert image.size == bare.size
+    assert image.size[0] == bare.size[0] and image.size[1] > bare.size[1]
     assert image.tobytes() != bare.tobytes()
 
 
@@ -691,3 +694,132 @@ def test_square_gradient_template_renders() -> None:
     sample = (60, 60)
     assert legacy.getpixel(sample) == (0, 0, 0)
     assert styled.getpixel(sample) != (0, 0, 0)
+
+
+# --- Premium label band below QR (FEAT-002) ------------------------
+
+
+def test_label_band_is_white_with_no_outline() -> None:
+    """The label band drawn below the QR must be a clean white region
+    with no surrounding outline rectangle. Sample pixels just under the
+    QR pattern at the leftmost and rightmost columns: both must be
+    pure white. If a rectangle outline were drawn around the band the
+    leftmost/rightmost pixel of that row would be the outline colour."""
+    bare = generate_qr("hello")
+    labelled = generate_qr("hello", label="42").convert("RGB")
+    qr_w, qr_h = bare.size
+
+    sample_y = qr_h + 2
+    assert labelled.getpixel((0, sample_y)) == (255, 255, 255)
+    assert labelled.getpixel((qr_w - 1, sample_y)) == (255, 255, 255)
+    # Mid-row sample: also pure white in a region that does not contain
+    # the glyph (the glyph sits a few pixels lower, after pad_y).
+    assert labelled.getpixel((qr_w // 4, sample_y)) == (255, 255, 255)
+
+
+def test_label_text_uses_template_foreground_colour() -> None:
+    """When a template is supplied the label text is drawn in the
+    template's foreground colour. ``running-track`` is solid red with
+    front_color = (211, 47, 47); the label band must contain many
+    red-ish pixels and zero pure-black pixels."""
+    bare = generate_qr("hello", template_id="running-track")
+    labelled = generate_qr(
+        "hello", label="42", template_id="running-track",
+    ).convert("RGB")
+    qr_w, qr_h = bare.size
+
+    red_count = 0
+    black_count = 0
+    for y in range(qr_h, labelled.size[1]):
+        for x in range(qr_w):
+            r, g, b = labelled.getpixel((x, y))
+            if r > 150 and g < 100 and b < 100:
+                red_count += 1
+            if (r, g, b) == (0, 0, 0):
+                black_count += 1
+
+    assert red_count >= 50, (
+        f"expected the label glyphs to produce many red-ish pixels in "
+        f"the band; got {red_count}"
+    )
+    assert black_count == 0, (
+        f"label band must not contain any pure-black pixels (text must "
+        f"be drawn in the template's foreground colour, not black); "
+        f"got {black_count}"
+    )
+
+
+def test_label_uses_bundled_truetype_font_not_bitmap_default() -> None:
+    """The label is rendered with the bundled Plus Jakarta Sans Bold
+    TTF, not PIL's bitmap default font. TTF glyphs are anti-aliased and
+    therefore introduce many partial-coverage pixels along the strokes;
+    PIL's bitmap default font renders only pure black or pure white at
+    the glyph boundary. We compare the count of non-pure-white,
+    non-pure-black pixels in the band: the TTF render must produce at
+    least 3x as many as the bitmap default."""
+    from PIL import Image as _Image
+    from PIL import ImageDraw as _ImageDraw
+    from PIL import ImageFont as _ImageFont
+
+    label = "42"
+    bare = generate_qr("hello")
+    labelled = generate_qr("hello", label=label).convert("RGB")
+    qr_w, qr_h = bare.size
+    band_h = labelled.size[1] - qr_h
+
+    # Build a control band with the same dimensions and centre the
+    # default bitmap font in it the same way the production code
+    # centres the TTF rendering.
+    control = _Image.new("RGB", (qr_w, band_h), (255, 255, 255))
+    cdraw = _ImageDraw.Draw(control)
+    default_font = _ImageFont.load_default()
+    bbox = cdraw.textbbox((0, 0), label, font=default_font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    text_x = (qr_w - text_w) // 2 - bbox[0]
+    text_y = (band_h - text_h) // 2 - bbox[1]
+    cdraw.text((text_x, text_y), label, fill=(0, 0, 0), font=default_font)
+
+    def _count_anti_aliased(img: _Image.Image, y_start: int, y_end: int) -> int:
+        count = 0
+        for y in range(y_start, y_end):
+            for x in range(img.width):
+                px = img.getpixel((x, y))
+                if px not in {(0, 0, 0), (255, 255, 255)}:
+                    count += 1
+        return count
+
+    ttf_count = _count_anti_aliased(labelled, qr_h, labelled.size[1])
+    default_count = _count_anti_aliased(control, 0, band_h)
+
+    assert ttf_count >= 3 * max(1, default_count), (
+        f"expected anti-aliased TTF glyphs to produce at least 3x the "
+        f"non-pure-black/white pixel count of PIL's bitmap default "
+        f"font; got ttf={ttf_count}, default={default_count}"
+    )
+
+
+def test_label_color_from_spec_picks_correct_stop() -> None:
+    """Each ``color_mask_kind`` maps onto its documented stop. An
+    unknown kind raises ``ValueError`` mirroring the closed-set policy
+    of ``_resolve_color_mask``."""
+    from qr_generator import _label_color_from_spec
+
+    assert _label_color_from_spec(
+        {"color_mask_kind": "solid", "front_color": (1, 2, 3)},
+    ) == (1, 2, 3)
+    assert _label_color_from_spec(
+        {"color_mask_kind": "radial_gradient", "center_color": (4, 5, 6)},
+    ) == (4, 5, 6)
+    assert _label_color_from_spec(
+        {"color_mask_kind": "square_gradient", "center_color": (7, 8, 9)},
+    ) == (7, 8, 9)
+    assert _label_color_from_spec(
+        {"color_mask_kind": "horizontal_gradient", "left_color": (10, 11, 12)},
+    ) == (10, 11, 12)
+    assert _label_color_from_spec(
+        {"color_mask_kind": "vertical_gradient", "top_color": (13, 14, 15)},
+    ) == (13, 14, 15)
+
+    with pytest.raises(ValueError, match="unknown color_mask_kind"):
+        _label_color_from_spec({"color_mask_kind": "rainbow"})

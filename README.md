@@ -257,6 +257,41 @@ failure: a clean 400 with `{"error": "data could not be encoded: ..."}`
 on the synchronous endpoints, and a terminal `{"event": "error", ...}`
 NDJSON line on `POST /api/qr/batch/stream`.
 
+#### Label rendering
+
+When a `label` is supplied (Single QR) or a non-empty `label_template`
+yields a label per item (Sequential Batch), the rendered image is
+taller than the bare QR by a clean white band drawn directly under the
+QR pattern. The band has no outline and no border rectangle: it is a
+flat white extension of the QR's white background.
+
+The label text is drawn in **Plus Jakarta Sans Bold** loaded from the
+bundled TrueType file at
+[`static/fonts/PlusJakartaSans-Bold.ttf`](static/fonts/PlusJakartaSans-Bold.ttf).
+The font is committed alongside its SIL Open Font License 1.1 file at
+[`static/fonts/OFL.txt`](static/fonts/OFL.txt) so the deployable
+package stays self-contained and no runtime download is required.
+The font size scales with the QR's pixel height (about 12% of the
+height with a 14 px floor), and the padding around the glyph in the
+band scales with the font size on both axes.
+
+The label colour follows the chosen template:
+
+- `default` (and the legacy plain render path when no template is
+  supplied) draws the label in pure black.
+- `solid` masks draw the label in `front_color`.
+- `radial_gradient` and `square_gradient` masks draw the label in
+  `center_color` (the centre stop of the gradient).
+- `horizontal_gradient` masks draw the label in `left_color`.
+- `vertical_gradient` masks draw the label in `top_color`.
+
+So a QR generated with `template_id=running-track` (solid red,
+`front_color=(211, 47, 47)`) prints its label in the same red as the
+QR modules, visually tying the label to the design rather than
+overlaying a separate badge on the pattern. The `label_height` form
+field is retained for backwards compatibility but is now ignored: the
+band's height is derived from the chosen font size.
+
 #### `GET /api/qr/templates`
 
 Returns the JSON listing of built-in design templates as
