@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>XlumaQR - QR code generator</title>
+    <link
+      rel="stylesheet"
+      href="{{ url_for('static', filename='style.css') }}"
+    />
+  </head>
+  <body>
+    <main class="container">
+      <header>
+        <h1>XlumaQR</h1>
+        <p class="tagline">
+          Generate a single QR code or a sequential batch (ZIP or PDF).
+        </p>
+      </header>
+
+      <nav class="tabs" role="tablist">
+        <button
+          type="button"
+          class="tab active"
+          data-tab="single"
+          role="tab"
+          aria-selected="true"
+        >
+          Single QR
+        </button>
+        <button
+          type="button"
+          class="tab"
+          data-tab="batch"
+          role="tab"
+          aria-selected="false"
+        >
+          Sequential Batch
+        </button>
+      </nav>
+
+      <section
+        id="panel-single"
+        class="panel active"
+        role="tabpanel"
+        aria-labelledby="single"
+      >
+        <form id="single-form" class="qr-form">
+          <div class="row">
+            <label for="single-data">Data (required)</label>
+            <input
+              type="text"
+              id="single-data"
+              name="data"
+              required
+              placeholder="https://example.com/123"
+            />
+          </div>
+          <div class="row">
+            <label for="single-label">Label (optional)</label>
+            <input
+              type="text"
+              id="single-label"
+              name="label"
+              placeholder="42"
+            />
+          </div>
+          <div class="row two-col">
+            <div>
+              <label for="single-box-size">Box size</label>
+              <input
+                type="number"
+                id="single-box-size"
+                name="box_size"
+                value="10"
+                min="1"
+              />
+            </div>
+            <div>
+              <label for="single-border">Border</label>
+              <input
+                type="number"
+                id="single-border"
+                name="border"
+                value="4"
+                min="0"
+              />
+            </div>
+          </div>
+          <div class="row">
+            <button type="submit" class="primary">Generate</button>
+          </div>
+          <div id="single-error" class="error" hidden></div>
+        </form>
+        <div id="single-preview" class="preview">
+          <p class="preview-empty">Your QR code will appear here.</p>
+        </div>
+      </section>
+
+      <section
+        id="panel-batch"
+        class="panel"
+        role="tabpanel"
+        aria-labelledby="batch"
+        hidden
+      >
+        <form id="batch-form" class="qr-form">
+          <div class="row two-col">
+            <div>
+              <label for="batch-start">Start (required)</label>
+              <input
+                type="number"
+                id="batch-start"
+                name="start"
+                value="101"
+                required
+              />
+            </div>
+            <div>
+              <label for="batch-padding">Padding</label>
+              <input
+                type="number"
+                id="batch-padding"
+                name="padding"
+                value="0"
+                min="0"
+              />
+            </div>
+          </div>
+
+          <fieldset class="row mode-toggle">
+            <legend>Range mode</legend>
+            <label>
+              <input
+                type="radio"
+                name="mode"
+                value="count"
+                checked
+              />
+              Count (number of codes)
+            </label>
+            <label>
+              <input type="radio" name="mode" value="end" />
+              End (last number, inclusive)
+            </label>
+          </fieldset>
+
+          <div class="row" id="batch-count-row">
+            <label for="batch-count">Count</label>
+            <input
+              type="number"
+              id="batch-count"
+              name="count"
+              value="100"
+              min="1"
+            />
+          </div>
+          <div class="row" id="batch-end-row" hidden>
+            <label for="batch-end">End</label>
+            <input type="number" id="batch-end" name="end" />
+          </div>
+
+          <div class="row">
+            <label for="batch-prefix">Filename prefix</label>
+            <input
+              type="text"
+              id="batch-prefix"
+              name="prefix"
+              placeholder="(optional, e.g. qr_)"
+            />
+          </div>
+          <div class="row two-col">
+            <div>
+              <label for="batch-data-template">Data template</label>
+              <input
+                type="text"
+                id="batch-data-template"
+                name="data_template"
+                value="{n}"
+              />
+            </div>
+            <div>
+              <label for="batch-label-template">Label template</label>
+              <input
+                type="text"
+                id="batch-label-template"
+                name="label_template"
+                value="{n}"
+                placeholder="empty = no label"
+              />
+            </div>
+          </div>
+          <div class="row two-col">
+            <div>
+              <label for="batch-box-size">Box size</label>
+              <input
+                type="number"
+                id="batch-box-size"
+                name="box_size"
+                value="10"
+                min="1"
+              />
+            </div>
+            <div>
+              <label for="batch-border">Border</label>
+              <input
+                type="number"
+                id="batch-border"
+                name="border"
+                value="4"
+                min="0"
+              />
+            </div>
+          </div>
+
+          <fieldset class="row format-toggle">
+            <legend>Download format</legend>
+            <label>
+              <input type="radio" name="format" value="zip" checked />
+              ZIP (one PNG per code)
+            </label>
+            <label>
+              <input type="radio" name="format" value="pdf" />
+              PDF (grid layout)
+            </label>
+          </fieldset>
+
+          <div class="row">
+            <p id="batch-hint" class="hint">
+              Will generate 100 QR codes: 101 -&gt; 200
+            </p>
+          </div>
+
+          <div class="row">
+            <button type="submit" class="primary">Generate &amp; download</button>
+          </div>
+          <div id="batch-error" class="error" hidden></div>
+        </form>
+      </section>
+    </main>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>
