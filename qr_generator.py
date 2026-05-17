@@ -1334,7 +1334,10 @@ def _pack_zip(
 
     When ``transparent=True`` (default), white backgrounds are converted
     to transparent so the QR can be overlaid on designs without needing
-    manual background removal.
+    manual background removal. Anti-aliased text edges are handled by
+    converting the image to RGBA and using the luminance of each pixel
+    to set its alpha — pure white becomes fully transparent, dark pixels
+    stay fully opaque, and intermediate grays get proportional alpha.
 
     Yields
     ------
@@ -1351,10 +1354,23 @@ def _pack_zip(
                 datas = image.getdata()
                 new_data = []
                 for item in datas:
-                    if item[0] > 240 and item[1] > 240 and item[2] > 240:
-                        new_data.append((item[0], item[1], item[2], 0))
+                    r, g, b, a = item
+                    # Use luminance to determine alpha:
+                    # Pure white (255,255,255) -> fully transparent
+                    # Pure black (0,0,0) -> fully opaque
+                    # Gray tones -> proportional alpha (handles anti-aliasing)
+                    luminance = (r + g + b) / 3.0
+                    if luminance > 250:
+                        # Pure white -> fully transparent
+                        new_data.append((r, g, b, 0))
+                    elif luminance > 200:
+                        # Near-white (anti-aliased edges) -> proportional alpha
+                        # Map 200-250 luminance to 255-0 alpha
+                        alpha = int((250 - luminance) * 255 / 50)
+                        new_data.append((r, g, b, alpha))
                     else:
-                        new_data.append(item)
+                        # Dark pixels stay fully opaque
+                        new_data.append((r, g, b, 255))
                 image.putdata(new_data)
             png_buf = io.BytesIO()
             image.save(png_buf, format="PNG")
@@ -2653,17 +2669,22 @@ def generate_qr_print_png(
     )
 
     if transparent:
-        # Convert white background to transparent using PIL's built-in
-        # operations for speed (avoids slow per-pixel Python loops).
+        # Convert white background to transparent with proper
+        # anti-aliasing handling. Uses luminance to set alpha so
+        # text edges blend smoothly without white halos.
         image = image.convert("RGBA")
         datas = image.getdata()
         new_data = []
         for item in datas:
-            # Make white and near-white pixels fully transparent
-            if item[0] > 240 and item[1] > 240 and item[2] > 240:
-                new_data.append((item[0], item[1], item[2], 0))
+            r, g, b, a = item
+            luminance = (r + g + b) / 3.0
+            if luminance > 250:
+                new_data.append((r, g, b, 0))
+            elif luminance > 200:
+                alpha = int((250 - luminance) * 255 / 50)
+                new_data.append((r, g, b, alpha))
             else:
-                new_data.append(item)
+                new_data.append((r, g, b, 255))
         image.putdata(new_data)
 
     buf = io.BytesIO()
