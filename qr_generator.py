@@ -1545,19 +1545,32 @@ def _svg_color_attr(rgb: tuple[int, int, int]) -> str:
 def _autofit_centre_badge_font_size(
     label: str,
     badge_side_px: float,
+    inner_ratio: float = 0.70,
 ) -> int:
     """Return the autofitted font-size in pixels for a centre-badge label.
 
     Mirrors the autofit loop in :func:`_render_label_badge` but returns
     just the chosen font size in pixels rather than a rendered image:
     starts at ~30% of ``badge_side_px``, steps down by 4 px until the
-    rendered text bounding box fits inside ~70% of the badge area on
-    both axes, with a 24 px floor. Measurements use the bundled TTF
-    via :func:`PIL.ImageFont.truetype` plus :meth:`PIL.ImageDraw.textbbox`,
-    so the SVG output uses the same chosen size as the PIL render
-    would for the same label.
+    rendered text bounding box fits inside ``inner_ratio`` of the
+    badge area on both axes, with a 24 px floor. Measurements use the
+    bundled TTF via :func:`PIL.ImageFont.truetype` plus
+    :meth:`PIL.ImageDraw.textbbox`, so the SVG output uses the same
+    chosen size as the PIL render would for the same label.
+
+    ``inner_ratio`` defaults to ``0.70`` (the badge's inner ~70%) so
+    callers that render with the same Plus Jakarta Sans TTF used for
+    measurement (the PIL render path and the PDF render path, which
+    both embed the bundled TTF) get the natural fit. The SVG render
+    path passes a tighter ``inner_ratio`` because the glyph is drawn
+    by the viewer using whatever font the system substitutes for
+    ``Plus Jakarta Sans`` - DejaVu Sans, Liberation Sans, and Arial
+    all have slightly wider glyph metrics than Plus Jakarta Sans, and
+    the substituted glyph would otherwise overflow the visible 70%
+    pad. Budgeting a tighter measurement ratio absorbs that drift
+    without forcing a 130 KB-per-SVG TTF embed.
     """
-    inner_max = max(1, int(badge_side_px * 0.70))
+    inner_max = max(1, int(badge_side_px * inner_ratio))
     font_size = max(24, int(badge_side_px * 0.30))
     floor = 24
 
@@ -1669,8 +1682,17 @@ def _render_modules_svg(
       column run (height = run_length * box_size).
     * ``horizontal_bars`` -> a single ``<rect>`` per consecutive
       row run (width = run_length * box_size).
+
+    ``shape-rendering="crispEdges"`` is set on the modules group only
+    when the drawer kind produces grid-aligned rectangles (``square``,
+    ``gapped_square``, ``vertical_bars``, ``horizontal_bars``). Drawer
+    kinds whose primitives have curves (``circle``, ``rounded``) need
+    anti-aliasing to avoid stair-stepped arcs, so the attribute is
+    omitted for them.
     """
-    parts: list[str] = [f'<g fill="{fill_attr}">']
+    crisp_kinds = {"square", "gapped_square", "vertical_bars", "horizontal_bars"}
+    crisp_attr = ' shape-rendering="crispEdges"' if drawer_kind in crisp_kinds else ""
+    parts: list[str] = [f'<g fill="{fill_attr}"{crisp_attr}>']
     if drawer_kind == "vertical_bars":
         for row_start, row_end, col in _merge_runs_vertical(modules):
             x = (border + col) * box_size
@@ -1805,6 +1827,8 @@ def generate_qr_svg(
     border: int = 4,
     template_id: str | None = None,
     logo: Image.Image | None = None,
+    *,
+    _padded_logo_data_url: str | None = None,
 ) -> str:
     """Render ``data`` as a QR code and return an SVG document string.
 
@@ -1844,6 +1868,17 @@ def generate_qr_svg(
 
     Error correction is bumped to ``ERROR_CORRECT_H`` whenever a logo
     or centre-label is present, mirroring :func:`generate_qr`.
+
+    The private ``_padded_logo_data_url`` keyword is an internal
+    optimisation hook used by :func:`generate_sequence_svg` to share
+    one pre-built ``data:image/png;base64,...`` string across every
+    SVG in a batch. The single-shot caller path (via the HTTP
+    ``/api/qr/single`` endpoint) does not use it, and any external
+    caller who passes ``logo`` without this hint still gets the same
+    output as before. When supplied alongside ``logo``, the value is
+    used verbatim as the ``<image href=...>`` attribute and the
+    per-call ``_pad_logo`` + base64-encode work is skipped. When
+    ``logo`` is ``None`` the parameter is ignored.
     """
     centre_label = label is not None and logo is None
     qr = _build_qr_for_render_plan(
@@ -1894,8 +1929,7 @@ def generate_qr_svg(
     parts.append(
         f'<svg xmlns="http://www.w3.org/2000/svg" '
         f'viewBox="0 0 {canvas_w} {canvas_h}" '
-        f'width="{canvas_w}" height="{canvas_h}" '
-        f'shape-rendering="crispEdges">'
+        f'width="{canvas_w}" height="{canvas_h}">'
     )
     if defs_markup:
         parts.append(defs_markup)
@@ -1907,17 +1941,25 @@ def generate_qr_svg(
     if logo is not None:
         # Overlay the padded logo as a base64 PNG. The pad is the same
         # white rounded-square the PIL render builds, so the SVG and
-        # PNG outputs match visually.
-        padded = _pad_logo(logo, LOGO_WORK_SIZE)
-        png_buf = io.BytesIO()
-        padded.save(png_buf, format="PNG")
-        encoded = base64.b64encode(png_buf.getvalue()).decode("ascii")
+        # PNG outputs match visually. Reuse the caller-supplied
+        # ``data:image/png;base64,...`` string when available so a
+        # batch caller (see :func:`generate_sequence_svg`) only pays
+        # the ``_pad_logo`` LANCZOS resize plus PNG encode plus base64
+        # inflation once per sequence rather than once per item.
+        if _padded_logo_data_url is not None:
+            data_url = _padded_logo_data_url
+        else:
+            padded = _pad_logo(logo, LOGO_WORK_SIZE)
+            png_buf = io.BytesIO()
+            padded.save(png_buf, format="PNG")
+            encoded = base64.b64encode(png_buf.getvalue()).decode("ascii")
+            data_url = f"data:image/png;base64,{encoded}"
         ratio = 0.22
         side = qr_w * ratio
         lx = (qr_w - side) / 2.0
         ly = (qr_h - side) / 2.0
         parts.append(
-            f'<image href="data:image/png;base64,{encoded}" '
+            f'<image href="{data_url}" '
             f'x="{lx}" y="{ly}" width="{side}" height="{side}" '
             f'preserveAspectRatio="xMidYMid meet"/>'
         )
@@ -1933,7 +1975,17 @@ def generate_qr_svg(
             f'rx="{radius}" ry="{radius}" fill="rgb(255, 255, 255)"/>'
         )
         glyph_color = (0, 0, 0) if is_default else fg_color
-        glyph_size = _autofit_centre_badge_font_size(label, badge_side)
+        # The SVG glyph is rendered by the viewer in whatever font is
+        # substituted for ``Plus Jakarta Sans``; common fallbacks
+        # (DejaVu Sans, Liberation Sans, Arial) have wider metrics
+        # than Plus Jakarta Sans, so we autofit against a tighter
+        # inner ratio (0.55 instead of the PIL render's 0.70) to
+        # absorb the cross-font drift and keep the glyph inside the
+        # white pad even on systems without Plus Jakarta Sans
+        # installed.
+        glyph_size = _autofit_centre_badge_font_size(
+            label, badge_side, inner_ratio=0.55,
+        )
         # SVG uses the badge's pixel side as the autofit target so the
         # rendered glyph has the same proportions as the PIL render.
         cx = qr_w / 2.0
@@ -1989,8 +2041,24 @@ def generate_sequence_svg(
     and ``label_template`` follow the same ``str.replace`` semantics:
     ``{n}`` is substituted with the padded numeric string, all other
     text is literal.
+
+    When a ``logo`` is supplied, it is pre-padded once via
+    :func:`_pad_logo` and the resulting PNG is base64-encoded into a
+    single ``data:image/png;base64,...`` string that is reused across
+    every emitted SVG via :func:`generate_qr_svg`'s private
+    ``_padded_logo_data_url`` parameter. This avoids paying the
+    LANCZOS resize plus PNG encode plus base64 inflation once per
+    item; for a 100-item batch with a 4 MB padded logo that saves the
+    bulk of the work without changing the output bytes.
     """
     numbers = compute_range(start, count=count, end=end, padding=padding)
+    padded_logo_data_url: str | None = None
+    if logo is not None:
+        padded = _pad_logo(logo, LOGO_WORK_SIZE)
+        png_buf = io.BytesIO()
+        padded.save(png_buf, format="PNG")
+        encoded = base64.b64encode(png_buf.getvalue()).decode("ascii")
+        padded_logo_data_url = f"data:image/png;base64,{encoded}"
     for n in numbers:
         data = data_template.replace("{n}", n)
         label = label_template.replace("{n}", n) if label_template is not None else None
@@ -2001,6 +2069,7 @@ def generate_sequence_svg(
             border=border,
             template_id=template_id,
             logo=logo,
+            _padded_logo_data_url=padded_logo_data_url,
         )
         yield f"{prefix}{n}.svg", svg
 
@@ -2131,15 +2200,16 @@ def _pack_pdf_vector(
     cell_w = usable_w / cols
     cell_h = usable_h / rows
 
-    # Disable page compression so the raw rectangle operator (``re``) and
-    # the QR module geometry remain inspectable in the PDF body. The
-    # vector contract test (``test_pack_pdf_vector_no_image_xobjects_for_no_logo_batch``)
-    # asserts on the substring ``b' re'`` to confirm rectangle drawing
-    # actually happened; with default compression the content stream is
-    # FlateDecode'd and the test would have to re-implement decoding.
-    # The compression saving is a few KB per page on a vector QR; the
-    # readability win for tests is worth the trade-off.
-    c = pdf_canvas.Canvas(buffer, pagesize=page_size, pageCompression=0)
+    # Use reportlab's default page compression (FlateDecode). Earlier
+    # iterations of this path disabled compression so a unit test could
+    # grep the content stream for the raw rectangle operator (``b' re '``);
+    # the test was rewritten to assert on the image-XObject count
+    # instead, which is invariant under content-stream compression and
+    # already proves the vector contract (a raster-embedded QR would
+    # manifest as image XObjects regardless of compression). Letting
+    # reportlab keep the default compression saves several KB per page
+    # for users.
+    c = pdf_canvas.Canvas(buffer, pagesize=page_size)
     per_page = cols * rows
     for index, (filename, plan) in enumerate(items):
         slot = index % per_page

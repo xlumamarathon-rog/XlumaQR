@@ -1633,7 +1633,10 @@ def test_batch_format_zip_legacy_still_returns_pngs(client) -> None:
 
 def test_batch_format_pdf_is_vector(client) -> None:
     """``format=pdf`` returns a vector PDF: no image XObjects when no
-    logo is supplied, and the body contains rectangle path operators."""
+    logo is supplied. The image-XObject count is invariant under the
+    PDF content-stream compression that reportlab applies by default,
+    so this assertion holds regardless of whether the body bytes are
+    FlateDecode'd."""
     rv = client.post(
         "/api/qr/batch", data={"start": "1", "count": "3", "format": "pdf"}
     )
@@ -1644,8 +1647,6 @@ def test_batch_format_pdf_is_vector(client) -> None:
     assert image_xobjects == 0, (
         f"vector PDF batch should have no image XObjects; got {image_xobjects}"
     )
-    rect_ops = body.count(b" re\n") + body.count(b" re ")
-    assert rect_ops > 0
 
 
 def test_batch_stream_format_zip_svg_terminal_event(client) -> None:

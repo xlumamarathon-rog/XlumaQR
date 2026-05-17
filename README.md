@@ -101,6 +101,43 @@ Form fields:
   (no full-canvas rect under the modules), and zoom-cleanly to any
   resolution.
 
+  > **Background asymmetry between formats:** the SVG and vector-PDF
+  > outputs intentionally drop the per-template `back_color` so the
+  > QR modules sit on a transparent canvas (matching the user
+  > request: "no solid background after downloading"). The legacy
+  > ZIP-of-PNGs path keeps the template's white `back_color` so the
+  > PNG bytes stay byte-identical for back-compat (the legacy
+  > byte-equality regression test still guards `generate_qr` for the
+  > no-template / no-logo case). If you save the same QR as both a
+  > PNG and an SVG you will see different effective backgrounds:
+  > opaque white in the PNG, transparent in the SVG and PDF.
+
+  > **Gradient parity caveat:** templates with a gradient
+  > `color_mask_kind` (e.g. `marathon-fire`'s radial fade or
+  > `running-energy`'s horizontal sweep) render the full gradient
+  > in the SVG path via `<linearGradient>` / `<radialGradient>`
+  > defs, but render as a single representative colour in the PDF
+  > path. The user's primary complaint is pixelation, not
+  > gradient-colour fidelity at zoom; the QR scannability and
+  > zoom-cleanliness are the headline contracts the vector formats
+  > deliver, while gradient-colour parity in PDF output is
+  > secondary. If you need full gradient fidelity in a downloadable
+  > artefact, choose `zip_svg` rather than `pdf`.
+
+  > **SVG batch + logo size caveat:** when a logo is supplied,
+  > every emitted SVG embeds the same padded-logo PNG as a
+  > base64 `<image>` data URI. A 1024x1024 padded-logo PNG runs
+  > roughly 50-100 KB; embedded in 100 SVG entries that is
+  > 6.5-13 MB inside the ZIP before any QR module markup. The
+  > streaming endpoint `/api/qr/batch/stream` carries a base64
+  > inflation on top, so the effective Vercel 4.5 MB streamed
+  > response cap (see "Response size limit" in
+  > `/api/qr/batch/stream`) is hit much earlier than for
+  > logo-less batches. If you need a few-dozen-item logo'd
+  > batch over a hosted streaming endpoint, prefer the
+  > synchronous `POST /api/qr/batch` (binary, no base64
+  > inflation) or split the batch.
+
 The page also shows a live range hint as you type, e.g.
 `Will generate 100 QR codes: 101 -> 200`.
 

@@ -307,18 +307,30 @@
 
           <fieldset class="row format-toggle">
             <legend>Download format</legend>
-            <label>
+            <label
+              title="Each QR is a vector SVG with a transparent background. Stays sharp at any zoom level. Gradient templates render the full gradient via SVG defs."
+            >
               <input type="radio" name="format" value="zip_svg" checked />
               ZIP (SVG vectors, no pixelation)
             </label>
-            <label>
+            <label
+              title="One PNG per QR. Legacy raster format; keeps the template's white background and pixelates on heavy zoom."
+            >
               <input type="radio" name="format" value="zip" />
               ZIP (one PNG per code, legacy)
             </label>
-            <label>
+            <label
+              title="Vector PDF grid layout with a transparent canvas. Stays sharp at any zoom. Note: gradient templates render as a single representative colour in PDF output; choose ZIP (SVG vectors) for full gradient fidelity."
+            >
               <input type="radio" name="format" value="pdf" />
               PDF (vector grid layout)
             </label>
+            <p class="format-toggle-note hint">
+              SVG and PDF downloads have a transparent background;
+              the legacy PNG ZIP keeps the template's white
+              background. Gradient templates render fully in SVG but
+              flatten to one colour in PDF.
+            </p>
           </fieldset>
 
           <div class="row">
