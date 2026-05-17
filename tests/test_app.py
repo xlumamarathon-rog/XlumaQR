@@ -1527,3 +1527,153 @@ def test_load_logo_maps_decompression_bomb_error_to_dimension_message() -> None:
         excinfo.value.__cause__, _Image.DecompressionBombError
     ), type(excinfo.value.__cause__).__name__
 
+
+
+# --- Vector downloads (FEAT-002) -----------------------------------
+
+
+def test_single_output_format_svg_returns_image_svg_xml(client) -> None:
+    """``output_format=svg`` returns ``image/svg+xml`` and an SVG body."""
+    rv = client.post(
+        "/api/qr/single", data={"data": "hello", "output_format": "svg"}
+    )
+    assert rv.status_code == 200
+    assert rv.mimetype == "image/svg+xml"
+    body = rv.data
+    head = body.lstrip()
+    assert head.startswith(b"<?xml") or head.startswith(b"<svg")
+    assert b"</svg>" in body
+
+
+def test_single_output_format_svg_has_transparent_background(client) -> None:
+    """The SVG response carries no full-canvas background rect: that
+    is the contract that delivers the user's "no solid white
+    background" complaint."""
+    import xml.etree.ElementTree as ET
+
+    rv = client.post(
+        "/api/qr/single", data={"data": "hello", "output_format": "svg"}
+    )
+    assert rv.status_code == 200
+    body = rv.data.decode("utf-8")
+    assert 'width="100%"' not in body or 'height="100%"' not in body
+    root = ET.fromstring(body)
+    ns = "{http://www.w3.org/2000/svg}"
+    width_attr = root.attrib.get("width", "")
+    height_attr = root.attrib.get("height", "")
+    for rect in root.iter(f"{ns}rect"):
+        rw = rect.attrib.get("width", "")
+        rh = rect.attrib.get("height", "")
+        rx = rect.attrib.get("x", "0")
+        ry = rect.attrib.get("y", "0")
+        if (
+            rx in {"0", "0.0"}
+            and ry in {"0", "0.0"}
+            and rw == width_attr
+            and rh == height_attr
+        ):
+            raise AssertionError(
+                f"found a full-canvas <rect> in the SVG response at "
+                f"({rx}, {ry}) sized {rw}x{rh}"
+            )
+
+
+def test_single_output_format_default_remains_png(client) -> None:
+    """Back-compat regression: omitting ``output_format`` still
+    returns ``image/png``."""
+    rv = client.post("/api/qr/single", data={"data": "hello"})
+    assert rv.status_code == 200
+    assert rv.mimetype == "image/png"
+    assert rv.data.startswith(PNG_MAGIC)
+
+
+def test_single_unknown_output_format_returns_400(client) -> None:
+    """Unknown ``output_format`` values are rejected with a clean 400."""
+    rv = client.post(
+        "/api/qr/single", data={"data": "hello", "output_format": "bmp"}
+    )
+    assert rv.status_code == 400
+    body = rv.get_json()
+    assert body is not None and "error" in body
+
+
+def test_batch_format_zip_svg_returns_zip_of_svgs(client) -> None:
+    """``format=zip_svg`` returns a ZIP archive whose entries are SVG
+    XML, named ``<n>.svg``."""
+    rv = client.post(
+        "/api/qr/batch",
+        data={"start": "1", "count": "3", "format": "zip_svg"},
+    )
+    assert rv.status_code == 200
+    assert rv.mimetype == "application/zip"
+    with zipfile.ZipFile(io.BytesIO(rv.data)) as zf:
+        names = zf.namelist()
+        assert names == ["1.svg", "2.svg", "3.svg"]
+        for name in names:
+            entry = zf.read(name)
+            head = entry.lstrip()
+            assert head.startswith(b"<?xml") or head.startswith(b"<svg")
+            assert b"</svg>" in entry
+
+
+def test_batch_format_zip_legacy_still_returns_pngs(client) -> None:
+    """Back-compat regression: the legacy ``format=zip`` path still
+    produces PNG entries."""
+    rv = client.post(
+        "/api/qr/batch", data={"start": "1", "count": "3", "format": "zip"}
+    )
+    assert rv.status_code == 200
+    assert rv.mimetype == "application/zip"
+    with zipfile.ZipFile(io.BytesIO(rv.data)) as zf:
+        names = zf.namelist()
+        assert names == ["1.png", "2.png", "3.png"]
+        for name in names:
+            assert zf.read(name).startswith(PNG_MAGIC)
+
+
+def test_batch_format_pdf_is_vector(client) -> None:
+    """``format=pdf`` returns a vector PDF: no image XObjects when no
+    logo is supplied, and the body contains rectangle path operators."""
+    rv = client.post(
+        "/api/qr/batch", data={"start": "1", "count": "3", "format": "pdf"}
+    )
+    assert rv.status_code == 200
+    assert rv.mimetype == "application/pdf"
+    body = rv.data
+    image_xobjects = body.count(b"/Subtype /Image") + body.count(b"/Subtype/Image")
+    assert image_xobjects == 0, (
+        f"vector PDF batch should have no image XObjects; got {image_xobjects}"
+    )
+    rect_ops = body.count(b" re\n") + body.count(b" re ")
+    assert rect_ops > 0
+
+
+def test_batch_stream_format_zip_svg_terminal_event(client) -> None:
+    """The streaming endpoint mirrors the synchronous path: a
+    ``zip_svg`` batch streams progress events (with .svg names) and
+    a terminal ``result`` event whose mimetype is ``application/zip``
+    and whose ZIP entries are SVGs."""
+    import base64 as _b64
+
+    rv = client.post(
+        "/api/qr/batch/stream",
+        data={"start": "1", "count": "2", "format": "zip_svg"},
+    )
+    assert rv.status_code == 200
+    assert rv.content_type.startswith("application/x-ndjson")
+
+    events = _parse_ndjson(rv.get_data())
+    progress_names = [e["name"] for e in events if e.get("event") == "progress"]
+    assert progress_names == ["1.svg", "2.svg"]
+
+    result = events[-1]
+    assert result["event"] == "result"
+    assert result["mimetype"] == "application/zip"
+    payload = _b64.b64decode(result["data_base64"])
+    assert payload.startswith(b"PK")
+    with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+        assert zf.namelist() == ["1.svg", "2.svg"]
+        for name in zf.namelist():
+            entry = zf.read(name)
+            head = entry.lstrip()
+            assert head.startswith(b"<?xml") or head.startswith(b"<svg")

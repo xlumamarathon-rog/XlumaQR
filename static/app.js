@@ -352,9 +352,9 @@
     var btn = document.createElement("button");
     btn.type = "button";
     btn.className = "primary preview-download";
-    btn.textContent = "Download HD PNG";
+    btn.textContent = "Download HD";
     btn.title =
-      "Re-renders at high resolution (~1640 px per side at default border for a typical URL payload) before downloading.";
+      "Renders the QR as a vector SVG so it stays sharp at any zoom level.";
 
     // Per-button AbortController so a second click on the SAME button
     // can cancel its previous in-flight fetch. Cross-button orphaning
@@ -402,6 +402,16 @@
         return;
       }
       hdFormData.set("box_size", String(HD_BOX_SIZE));
+      // FEAT-002: the HD download path now requests an SVG so the
+      // saved file stays sharp at any zoom level. The on-screen
+      // preview Blob remains a PNG (rendered by the styled PIL
+      // pipeline) and is used as the fallback if the SVG fetch
+      // fails. Note the asymmetry: the success download is .svg,
+      // the fallback is .png. That is intentional because the
+      // cached preview Blob is whatever the live preview rendered
+      // (PNG today), and a fallback PNG is still better than no
+      // file at all.
+      hdFormData.set("output_format", "svg");
 
       // Cancel any earlier HD fetch from this same button before
       // starting a new one.
@@ -441,7 +451,21 @@
           return response.blob();
         })
         .then(function (hdBlob) {
-          triggerDownload(hdBlob, filename);
+          // FEAT-002: the HD response is an SVG, so the saved file
+          // must end in .svg. The ``filename`` argument carries the
+          // PNG-suffixed fallback name (since the cached preview
+          // Blob is a PNG), so derive the SVG filename here. The
+          // asymmetry between the success (.svg) and fallback (.png)
+          // names is intentional: a fallback PNG saved as .svg would
+          // confuse OS file viewers and image editors.
+          var svgFilename = filename.replace(/\.png$/i, ".svg");
+          if (svgFilename === filename) {
+            // Defensive fallback if the caller passed an unexpected
+            // extension; append .svg so the saved file at least
+            // matches its content.
+            svgFilename = filename + ".svg";
+          }
+          triggerDownload(hdBlob, svgFilename);
         })
         .catch(function (err) {
           // AbortError fires when a second click or a redraw cancels

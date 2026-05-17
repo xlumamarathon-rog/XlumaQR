@@ -29,10 +29,14 @@ from qr_generator import (
     MAX_PADDING,
     compute_range,
     generate_qr,
+    generate_qr_svg,
     generate_sequence,
+    generate_sequence_render_plan,
+    generate_sequence_svg,
     get_template,
     images_to_pdf,
     images_to_zip,
+    iter_batch_vector_with_progress,
     iter_batch_with_progress,
     list_templates,
     render_template_preview,
@@ -297,7 +301,21 @@ def _load_logo_from_request() -> Image.Image | None:
 
 @app.route("/api/qr/single", methods=["POST"])
 def api_single() -> Response:
-    """Render a single QR code and return it as a PNG response."""
+    """Render a single QR code and return it as a PNG or SVG response.
+
+    ``output_format`` (optional, default ``png``) selects the rendered
+    artefact:
+
+    * ``png`` (default): the legacy raster path. The on-screen preview
+      uses this so the styled PIL renderer's pixel output is what the
+      user sees.
+    * ``svg``: the vector path (FEAT-002). Returns an
+      ``image/svg+xml`` body whose QR pattern is fully vector and so
+      stays sharp at any zoom level. The HD download button on the
+      Single QR and Batch live previews uses this format. Embedded
+      logos are encoded as base64 PNG data URIs (small region, raster
+      trade-off documented in :func:`qr_generator.generate_qr_svg`).
+    """
     data = request.form.get("data", "").strip()
     if not data:
         return jsonify({"error": "data is required"}), 400
@@ -307,6 +325,10 @@ def api_single() -> Response:
     label = request.form.get("label")
     if label is not None and label == "":
         label = None
+
+    output_format = (request.form.get("output_format") or "png").strip().lower()
+    if output_format not in {"png", "svg"}:
+        return jsonify({"error": "output_format must be 'png' or 'svg'"}), 400
 
     try:
         box_size = _parse_int(
@@ -329,6 +351,26 @@ def api_single() -> Response:
         return jsonify({"error": str(exc)}), 400
 
     assert box_size is not None and border is not None  # defaults guarantee non-None
+
+    if output_format == "svg":
+        try:
+            svg = generate_qr_svg(
+                data,
+                label=label,
+                box_size=box_size,
+                border=border,
+                template_id=template_id,
+                logo=logo,
+            )
+        except ValueError as exc:
+            return jsonify({"error": f"data could not be encoded: {exc}"}), 400
+        return send_file(
+            io.BytesIO(svg.encode("utf-8")),
+            mimetype="image/svg+xml",
+            as_attachment=False,
+            download_name="qr.svg",
+        )
+
     try:
         image = generate_qr(
             data,
@@ -356,35 +398,87 @@ def api_single() -> Response:
 
 @app.route("/api/qr/batch", methods=["POST"])
 def api_batch() -> Response:
-    """Render a sequential batch and return a ZIP or PDF response."""
+    """Render a sequential batch and return a ZIP or PDF response.
+
+    The ``format`` field selects the artefact:
+
+    * ``zip`` (legacy): one PNG per code in a ZIP archive. Preserved
+      for back-compat; the rendered entries are PIL images.
+    * ``zip_svg`` (FEAT-002): one SVG per code in a ZIP archive. Each
+      entry's QR pattern is fully vector and so stays sharp at any
+      zoom level. Mimetype is ``application/zip``; entries end in
+      ``.svg``.
+    * ``pdf`` (FEAT-002): a vector PDF where each QR module is drawn
+      as a reportlab primitive (no embedded raster image XObjects
+      unless a logo is supplied). The grid layout is unchanged.
+    """
     parsed, err = _parse_batch_form()
     if err is not None:
         return jsonify({"error": err}), 400
     assert parsed is not None
 
-    items = generate_sequence(
-        start=parsed["start"],
-        count=parsed["count"],
-        end=parsed["end"],
-        data_template=parsed["data_template"],
-        label_template=parsed["label_template"],
-        padding=parsed["padding"],
-        prefix=parsed["prefix"],
-        box_size=parsed["box_size"],
-        border=parsed["border"],
-        template_id=parsed["template_id"],
-        logo=parsed["logo"],
-    )
-
     fmt = parsed["fmt"]
     first_n = parsed["first_n"]
     last_n = parsed["last_n"]
+
     try:
         if fmt == "pdf":
-            payload = images_to_pdf(items)
+            plans = generate_sequence_render_plan(
+                start=parsed["start"],
+                count=parsed["count"],
+                end=parsed["end"],
+                data_template=parsed["data_template"],
+                label_template=parsed["label_template"],
+                padding=parsed["padding"],
+                prefix=parsed["prefix"],
+                box_size=parsed["box_size"],
+                border=parsed["border"],
+                template_id=parsed["template_id"],
+                logo=parsed["logo"],
+            )
+            payload: bytes | None = None
+            for token in iter_batch_vector_with_progress(plans, "pdf"):
+                if token[0] == "result":
+                    payload = token[1]
+            assert payload is not None
             mimetype = "application/pdf"
             filename = f"qr_batch_{first_n}_{last_n}.pdf"
+        elif fmt == "zip_svg":
+            svg_items = generate_sequence_svg(
+                start=parsed["start"],
+                count=parsed["count"],
+                end=parsed["end"],
+                data_template=parsed["data_template"],
+                label_template=parsed["label_template"],
+                padding=parsed["padding"],
+                prefix=parsed["prefix"],
+                box_size=parsed["box_size"],
+                border=parsed["border"],
+                template_id=parsed["template_id"],
+                logo=parsed["logo"],
+            )
+            payload2: bytes | None = None
+            for token in iter_batch_vector_with_progress(svg_items, "zip_svg"):
+                if token[0] == "result":
+                    payload2 = token[1]
+            assert payload2 is not None
+            payload = payload2
+            mimetype = "application/zip"
+            filename = f"qr_batch_{first_n}_{last_n}.zip"
         else:
+            items = generate_sequence(
+                start=parsed["start"],
+                count=parsed["count"],
+                end=parsed["end"],
+                data_template=parsed["data_template"],
+                label_template=parsed["label_template"],
+                padding=parsed["padding"],
+                prefix=parsed["prefix"],
+                box_size=parsed["box_size"],
+                border=parsed["border"],
+                template_id=parsed["template_id"],
+                logo=parsed["logo"],
+            )
             payload = images_to_zip(items)
             mimetype = "application/zip"
             filename = f"qr_batch_{first_n}_{last_n}.zip"
@@ -470,8 +564,8 @@ def _parse_batch_form() -> tuple[dict[str, Any] | None, str | None]:
         return None, f"label_template must be <= {MAX_DATA_LENGTH} characters"
 
     fmt = (request.form.get("format") or "zip").strip().lower()
-    if fmt not in {"zip", "pdf"}:
-        return None, "format must be 'zip' or 'pdf'"
+    if fmt not in {"zip", "zip_svg", "pdf"}:
+        return None, "format must be 'zip', 'zip_svg', or 'pdf'"
 
     # Validate the range up front so we can return a clean 400 before we
     # start rendering hundreds of QR codes.
@@ -536,22 +630,57 @@ def api_batch_stream() -> Response:
         mimetype = "application/pdf"
         filename = f"qr_batch_{first_n}_{last_n}.pdf"
     else:
+        # Both ``zip`` (PNG entries) and ``zip_svg`` (SVG entries) are
+        # delivered as ``application/zip`` archives; the entries inside
+        # carry the appropriate per-file extension.
         mimetype = "application/zip"
         filename = f"qr_batch_{first_n}_{last_n}.zip"
 
-    items = generate_sequence(
-        start=parsed["start"],
-        count=parsed["count"],
-        end=parsed["end"],
-        data_template=parsed["data_template"],
-        label_template=parsed["label_template"],
-        padding=parsed["padding"],
-        prefix=parsed["prefix"],
-        box_size=parsed["box_size"],
-        border=parsed["border"],
-        template_id=parsed["template_id"],
-        logo=parsed["logo"],
-    )
+    if fmt == "zip_svg":
+        items = generate_sequence_svg(
+            start=parsed["start"],
+            count=parsed["count"],
+            end=parsed["end"],
+            data_template=parsed["data_template"],
+            label_template=parsed["label_template"],
+            padding=parsed["padding"],
+            prefix=parsed["prefix"],
+            box_size=parsed["box_size"],
+            border=parsed["border"],
+            template_id=parsed["template_id"],
+            logo=parsed["logo"],
+        )
+        packer = lambda src: iter_batch_vector_with_progress(src, "zip_svg")
+    elif fmt == "pdf":
+        items = generate_sequence_render_plan(
+            start=parsed["start"],
+            count=parsed["count"],
+            end=parsed["end"],
+            data_template=parsed["data_template"],
+            label_template=parsed["label_template"],
+            padding=parsed["padding"],
+            prefix=parsed["prefix"],
+            box_size=parsed["box_size"],
+            border=parsed["border"],
+            template_id=parsed["template_id"],
+            logo=parsed["logo"],
+        )
+        packer = lambda src: iter_batch_vector_with_progress(src, "pdf")
+    else:
+        items = generate_sequence(
+            start=parsed["start"],
+            count=parsed["count"],
+            end=parsed["end"],
+            data_template=parsed["data_template"],
+            label_template=parsed["label_template"],
+            padding=parsed["padding"],
+            prefix=parsed["prefix"],
+            box_size=parsed["box_size"],
+            border=parsed["border"],
+            template_id=parsed["template_id"],
+            logo=parsed["logo"],
+        )
+        packer = lambda src: iter_batch_with_progress(src, fmt)
 
     def _ndjson(obj: dict[str, Any]) -> str:
         # ``ensure_ascii`` keeps non-ASCII filenames safe on the wire as
@@ -578,7 +707,7 @@ def api_batch_stream() -> Response:
         # than buffering all N images while we wait to start packing.
         try:
             payload: bytes | None = None
-            for token in iter_batch_with_progress(items, fmt):
+            for token in packer(items):
                 kind = token[0]
                 if kind == "progress":
                     _, index, name = token

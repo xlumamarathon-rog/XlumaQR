@@ -36,17 +36,23 @@ Form fields:
 - `border` (default 4): quiet-zone width in modules.
 
 The on-screen preview is rendered at the `box_size` you typed (default
-10, fast). The **Download HD PNG** button re-renders at `box_size = 40`
-before downloading so the saved file is high-resolution (roughly
-1640 px per side at the default border for a payload that encodes to
-a 33-module QR, e.g. a typical URL of about 25 to 35 characters at
-error-correction H, which is the level used whenever a logo or label
-is supplied). Shorter payloads encode a smaller QR version and so
-produce a smaller HD PNG, e.g. ~1160 px for a few-character payload
-and ~1320 px for a short URL. Either way the download is far larger
-than the preview's ~330 px at the default `box_size = 10`. To
-download at any other `box_size`, set the form field directly: the
-preview will then match the download.
+10, fast). The **Download HD** button re-renders the QR as a vector
+SVG and downloads it via `output_format=svg`, so the saved file stays
+sharp at any zoom level (no pixelation, regardless of how far the user
+zooms in or how large they print the file). The on-screen preview
+stays PNG: the styled PIL renderer is what produces the visible
+thumbnail, and the vector path is reserved for the saved download.
+
+If the SVG fetch fails for any reason (network, encoder error) the
+button falls back to downloading the cached preview Blob as a PNG so
+the user still gets a file. The asymmetry between the success
+filename (`qr.svg`) and the fallback filename (`qr.png`) is
+intentional: a fallback PNG saved as `.svg` would confuse OS file
+viewers and image editors.
+
+To download a raster PNG at a custom `box_size` instead, set the
+`box_size` form field directly: `POST /api/qr/single` without
+`output_format` still returns PNG bytes (back-compat).
 
 ## Sequential Batch
 
@@ -83,7 +89,17 @@ Form fields:
 - `label_template` (default `{n}`): template for the printed label.
   Empty means no label.
 - `box_size` (default 10), `border` (default 4): same as Single QR.
-- `format` (`zip` or `pdf`, default `zip`): download format.
+- `format` (`zip`, `zip_svg`, or `pdf`, default `zip_svg` in the UI):
+  download format. `zip_svg` (FEAT-002) returns one SVG per code in a
+  ZIP, where every QR pattern is fully vector and so stays sharp at
+  any zoom level. `zip` returns the legacy ZIP-of-PNGs (preserved for
+  back-compat). `pdf` returns a single vector PDF where every QR
+  module is a reportlab path primitive (no embedded raster image
+  XObjects unless a logo is supplied). The vector formats deliver
+  the user-facing "no pixelation, no solid background" contract: SVG
+  and vector-PDF outputs both have a transparent background by design
+  (no full-canvas rect under the modules), and zoom-cleanly to any
+  resolution.
 
 The page also shows a live range hint as you type, e.g.
 `Will generate 100 QR codes: 101 -> 200`.
@@ -92,7 +108,21 @@ The page also shows a live range hint as you type, e.g.
 
 ### `POST /api/qr/single`
 
-Returns `image/png`.
+Returns `image/png` by default, or `image/svg+xml` when
+`output_format=svg` is passed. The SVG path (FEAT-002) is the vector
+format the **Download HD** button uses: every QR module is an SVG
+primitive so the saved file stays sharp at any zoom level. Embedded
+logos are encoded as base64 PNG data URIs inside an `<image>`
+element (small region, raster trade-off; the QR pattern around the
+logo stays vector). Label text is referenced by family name
+(`Plus Jakarta Sans`) with a sans-serif fallback rather than embedded
+as a 130 KB TTF data URL: a batch ZIP of 100 SVGs would be hundreds
+of KB heavier with embedded fonts, and the QR pattern (the part
+users complained about pixelating) is vector regardless of the font
+choice. The SVG output keeps a transparent background by design: no
+full-canvas `<rect>` covers the canvas under the modules, so the
+download carries just the QR pattern (and the logo / centre badge /
+label band where applicable).
 
 ```bash
 curl -fsS -X POST \
@@ -100,6 +130,12 @@ curl -fsS -X POST \
   -F label=42 \
   http://127.0.0.1:5000/api/qr/single \
   -o qr.png
+
+curl -fsS -X POST \
+  -F data=hello \
+  -F output_format=svg \
+  http://127.0.0.1:5000/api/qr/single \
+  -o qr.svg
 ```
 
 ### `POST /api/qr/batch`

@@ -36,10 +36,12 @@ Public API
 
 from __future__ import annotations
 
+import base64
 import copy
 import functools
 import io
 import os
+import xml.sax.saxutils
 import zipfile
 from typing import Iterable, Iterator
 
@@ -64,15 +66,21 @@ from qrcode.image.styles.moduledrawers.pil import (
 )
 from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.utils import ImageReader
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas as pdf_canvas
 
 __all__ = [
     "generate_qr",
+    "generate_qr_svg",
     "compute_range",
     "generate_sequence",
+    "generate_sequence_svg",
+    "generate_sequence_render_plan",
     "images_to_zip",
     "images_to_pdf",
     "iter_batch_with_progress",
+    "iter_batch_vector_with_progress",
     "list_templates",
     "get_template",
     "render_template_preview",
@@ -165,6 +173,22 @@ LOGO_WORK_SIZE = 1024
 LABEL_FONT_PATH = os.path.join(
     os.path.dirname(__file__), "static", "fonts", "PlusJakartaSans-Bold.ttf",
 )
+
+
+# Register the bundled TTF with reportlab once at import time so the
+# vector PDF path can call ``c.setFont('PlusJakartaSans-Bold', size)``
+# without re-registering on every render. ``registerFont`` is
+# idempotent within a process but raises on import-side failure (e.g.
+# the font file going missing); guard with try/except so a packaging
+# accident does not break unrelated callers that never need the
+# vector PDF path. The SVG path references the font by its CSS
+# family name (``Plus Jakarta Sans``) and accepts system fallback
+# rather than embedding the ~130 KB TTF as base64 in every SVG.
+_PDF_LABEL_FONT_NAME = "PlusJakartaSans-Bold"
+try:
+    pdfmetrics.registerFont(TTFont(_PDF_LABEL_FONT_NAME, LABEL_FONT_PATH))
+except Exception:  # pragma: no cover - defensive, font ships in-tree
+    pass
 
 
 # --- Templates registry --------------------------------------------------
@@ -1507,3 +1531,844 @@ def iter_batch_with_progress(
         yield from _pack_pdf(items)
     else:
         raise ValueError("fmt must be 'zip' or 'pdf'")
+
+
+# --- Vector rendering (SVG single + ZIP-of-SVGs + native vector PDF) ---
+
+
+def _svg_color_attr(rgb: tuple[int, int, int]) -> str:
+    """Return the SVG ``rgb(r, g, b)`` literal for an RGB tuple."""
+    r, g, b = rgb
+    return f"rgb({r}, {g}, {b})"
+
+
+def _autofit_centre_badge_font_size(
+    label: str,
+    badge_side_px: float,
+) -> int:
+    """Return the autofitted font-size in pixels for a centre-badge label.
+
+    Mirrors the autofit loop in :func:`_render_label_badge` but returns
+    just the chosen font size in pixels rather than a rendered image:
+    starts at ~30% of ``badge_side_px``, steps down by 4 px until the
+    rendered text bounding box fits inside ~70% of the badge area on
+    both axes, with a 24 px floor. Measurements use the bundled TTF
+    via :func:`PIL.ImageFont.truetype` plus :meth:`PIL.ImageDraw.textbbox`,
+    so the SVG output uses the same chosen size as the PIL render
+    would for the same label.
+    """
+    inner_max = max(1, int(badge_side_px * 0.70))
+    font_size = max(24, int(badge_side_px * 0.30))
+    floor = 24
+
+    measure = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    while True:
+        font = _load_label_font(font_size)
+        try:
+            bbox = measure.textbbox((0, 0), label, font=font)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
+        except AttributeError:  # pragma: no cover - Pillow < 9.2 fallback
+            text_w, text_h = measure.textsize(label, font=font)  # type: ignore[attr-defined]
+        if (text_w <= inner_max and text_h <= inner_max) or font_size <= floor:
+            return font_size
+        font_size = max(floor, font_size - 4)
+
+
+def _build_qr_for_render_plan(
+    data: str,
+    template_id: str | None,
+    logo: Image.Image | None,
+    label: str | None,
+    box_size: int,
+    border: int,
+):
+    """Build a fitted ``qrcode.QRCode`` instance with the right error level.
+
+    Centralises the error-correction policy used by both
+    :func:`generate_qr_svg` and :func:`generate_sequence_render_plan`:
+    bump to ``ERROR_CORRECT_H`` whenever a logo or centre-label is
+    present (matches :func:`generate_qr`), otherwise ``ERROR_CORRECT_M``.
+    Returns the fitted ``QRCode`` so callers can read ``qr.modules``
+    and ``qr.modules_count`` directly.
+    """
+    centre_label = label is not None and logo is None
+    error_correction = (
+        ERROR_CORRECT_H if (logo is not None or centre_label) else ERROR_CORRECT_M
+    )
+    qr = qrcode.QRCode(
+        error_correction=error_correction,
+        box_size=box_size,
+        border=border,
+    )
+    qr.add_data(data)
+    qr.make(fit=True)
+    return qr
+
+
+def _merge_runs_horizontal(modules: list[list[bool]]) -> Iterator[tuple[int, int, int]]:
+    """Yield ``(row, col_start, col_end_exclusive)`` runs of on-modules per row.
+
+    Used by the ``horizontal_bars`` SVG / PDF code to emit a single
+    rectangle per consecutive horizontal run instead of one per module.
+    """
+    for row, cells in enumerate(modules):
+        col = 0
+        n = len(cells)
+        while col < n:
+            if cells[col]:
+                start = col
+                while col < n and cells[col]:
+                    col += 1
+                yield row, start, col
+            else:
+                col += 1
+
+
+def _merge_runs_vertical(modules: list[list[bool]]) -> Iterator[tuple[int, int, int]]:
+    """Yield ``(row_start, row_end_exclusive, col)`` runs of on-modules per column.
+
+    Used by the ``vertical_bars`` SVG / PDF code to emit a single
+    rectangle per consecutive vertical run instead of one per module.
+    """
+    if not modules:
+        return
+    n_rows = len(modules)
+    n_cols = len(modules[0]) if n_rows else 0
+    for col in range(n_cols):
+        row = 0
+        while row < n_rows:
+            if modules[row][col]:
+                start = row
+                while row < n_rows and modules[row][col]:
+                    row += 1
+                yield start, row, col
+            else:
+                row += 1
+
+
+def _render_modules_svg(
+    modules: list[list[bool]],
+    border: int,
+    box_size: int,
+    drawer_kind: str,
+    fill_attr: str,
+) -> str:
+    """Render the on-modules of ``modules`` as SVG primitives.
+
+    Returns the markup for a single ``<g>`` element whose ``fill``
+    attribute is ``fill_attr`` (typically ``rgb(r, g, b)`` or
+    ``url(#...)``) wrapping the per-module shapes. The shape choice
+    follows the closed set used by the styled PIL renderer:
+
+    * ``square`` -> ``<rect>`` per on-module.
+    * ``rounded`` -> ``<rect>`` with ``rx=ry=box_size/2``.
+    * ``circle`` -> ``<circle>`` with ``r=box_size/2``.
+    * ``gapped_square`` -> ``<rect>`` inset by ~10% of ``box_size``.
+    * ``vertical_bars`` -> a single ``<rect>`` per consecutive
+      column run (height = run_length * box_size).
+    * ``horizontal_bars`` -> a single ``<rect>`` per consecutive
+      row run (width = run_length * box_size).
+    """
+    parts: list[str] = [f'<g fill="{fill_attr}">']
+    if drawer_kind == "vertical_bars":
+        for row_start, row_end, col in _merge_runs_vertical(modules):
+            x = (border + col) * box_size
+            y = (border + row_start) * box_size
+            w = box_size
+            h = (row_end - row_start) * box_size
+            parts.append(
+                f'<rect x="{x}" y="{y}" width="{w}" height="{h}"/>'
+            )
+    elif drawer_kind == "horizontal_bars":
+        for row, col_start, col_end in _merge_runs_horizontal(modules):
+            x = (border + col_start) * box_size
+            y = (border + row) * box_size
+            w = (col_end - col_start) * box_size
+            h = box_size
+            parts.append(
+                f'<rect x="{x}" y="{y}" width="{w}" height="{h}"/>'
+            )
+    else:
+        # Per-module primitives.
+        inset = max(1, int(round(box_size * 0.10))) if drawer_kind == "gapped_square" else 0
+        radius = box_size / 2.0
+        for row, cells in enumerate(modules):
+            for col, on in enumerate(cells):
+                if not on:
+                    continue
+                x = (border + col) * box_size
+                y = (border + row) * box_size
+                if drawer_kind == "circle":
+                    cx = x + radius
+                    cy = y + radius
+                    parts.append(
+                        f'<circle cx="{cx}" cy="{cy}" r="{radius}"/>'
+                    )
+                elif drawer_kind == "rounded":
+                    parts.append(
+                        f'<rect x="{x}" y="{y}" width="{box_size}" '
+                        f'height="{box_size}" rx="{radius}" ry="{radius}"/>'
+                    )
+                elif drawer_kind == "gapped_square":
+                    gx = x + inset
+                    gy = y + inset
+                    gw = box_size - 2 * inset
+                    gh = box_size - 2 * inset
+                    parts.append(
+                        f'<rect x="{gx}" y="{gy}" width="{gw}" height="{gh}"/>'
+                    )
+                else:  # square (default)
+                    parts.append(
+                        f'<rect x="{x}" y="{y}" width="{box_size}" '
+                        f'height="{box_size}"/>'
+                    )
+    parts.append("</g>")
+    return "".join(parts)
+
+
+def _build_svg_color_def(
+    spec: dict | None,
+    qr_w: int,
+    qr_h: int,
+) -> tuple[str, str]:
+    """Return ``(defs_markup, fill_attr)`` for the on-module ``<g>``.
+
+    The default template (or ``spec=None``) produces ``rgb(0, 0, 0)``
+    and an empty defs string. Solid masks use the template's
+    ``front_color`` directly. Gradient masks emit a ``<linearGradient>``
+    or ``<radialGradient>`` inside ``<defs>`` and return ``url(#qr-fill)``
+    so the on-module ``<g>`` references it.
+
+    ``qr_w`` / ``qr_h`` are the QR pattern's pixel width and height
+    (excluding the optional label band): the gradient stops are bounded
+    to the QR area so the PIL render's appearance is preserved as
+    closely as SVG allows.
+    """
+    if spec is None:
+        return "", _svg_color_attr((0, 0, 0))
+
+    kind = spec.get("color_mask_kind")
+    if kind == "solid":
+        return "", _svg_color_attr(spec["front_color"])
+
+    grad_id = "qr-fill"
+    if kind == "horizontal_gradient":
+        left = spec["left_color"]
+        right = spec["right_color"]
+        defs = (
+            f'<defs><linearGradient id="{grad_id}" '
+            f'gradientUnits="userSpaceOnUse" '
+            f'x1="0" y1="0" x2="{qr_w}" y2="0">'
+            f'<stop offset="0%" stop-color="{_svg_color_attr(left)}"/>'
+            f'<stop offset="100%" stop-color="{_svg_color_attr(right)}"/>'
+            "</linearGradient></defs>"
+        )
+        return defs, f"url(#{grad_id})"
+    if kind == "vertical_gradient":
+        top = spec["top_color"]
+        bottom = spec["bottom_color"]
+        defs = (
+            f'<defs><linearGradient id="{grad_id}" '
+            f'gradientUnits="userSpaceOnUse" '
+            f'x1="0" y1="0" x2="0" y2="{qr_h}">'
+            f'<stop offset="0%" stop-color="{_svg_color_attr(top)}"/>'
+            f'<stop offset="100%" stop-color="{_svg_color_attr(bottom)}"/>'
+            "</linearGradient></defs>"
+        )
+        return defs, f"url(#{grad_id})"
+    if kind in {"radial_gradient", "square_gradient"}:
+        center = spec["center_color"]
+        edge = spec["edge_color"]
+        # Radius is bounded to half the QR pattern's width (NOT the
+        # full canvas including any label band) so the gradient stays
+        # centred on the QR and does not bleed into the band.
+        radius = qr_w / 2.0
+        cx = qr_w / 2.0
+        cy = qr_h / 2.0
+        defs = (
+            f'<defs><radialGradient id="{grad_id}" '
+            f'gradientUnits="userSpaceOnUse" '
+            f'cx="{cx}" cy="{cy}" r="{radius}">'
+            f'<stop offset="0%" stop-color="{_svg_color_attr(center)}"/>'
+            f'<stop offset="100%" stop-color="{_svg_color_attr(edge)}"/>'
+            "</radialGradient></defs>"
+        )
+        return defs, f"url(#{grad_id})"
+    raise ValueError(f"unknown color_mask_kind: {kind!r}")
+
+
+def generate_qr_svg(
+    data: str,
+    label: str | None = None,
+    box_size: int = 10,
+    border: int = 4,
+    template_id: str | None = None,
+    logo: Image.Image | None = None,
+) -> str:
+    """Render ``data`` as a QR code and return an SVG document string.
+
+    Mirrors the contract of :func:`generate_qr` but emits SVG markup
+    instead of a PIL image. The QR pattern is fully vector (each
+    on-module is an SVG primitive) so the result stays sharp at any
+    zoom level. The output has a transparent background by design: no
+    ``<rect>`` covers the canvas under the modules.
+
+    Two raster trade-offs are deliberate:
+
+    * Embedded logos are encoded as base64 PNG data URIs and pasted
+      via ``<image>``. The QR pattern around the logo stays vector,
+      which is what users actually complain about pixelating; the
+      logo region is small (~22% of the QR width) and acceptable.
+      The ``href`` attribute (modern SVG2) is used rather than the
+      legacy ``xlink:href`` so the root ``<svg>`` does not need the
+      ``xmlns:xlink`` namespace declaration. Modern browsers accept
+      ``href`` directly; very old SVG viewers may need ``xlink:href``,
+      but we accept that compatibility floor in exchange for a
+      cleaner root element.
+    * Label text is referenced by family name (``Plus Jakarta Sans``)
+      with a sans-serif fallback rather than embedded as a 130 KB TTF
+      data URL. A batch ZIP of 100 SVGs would be hundreds of KB
+      heavier with embedded fonts; system fallback is acceptable for
+      label glyphs, and the QR pattern (the part the user complained
+      about) is vector regardless of the font choice.
+
+    Layout matches :func:`generate_qr`:
+
+    * No label, no logo: bare QR.
+    * Label only: centred badge on a white rounded-square pad in the
+      QR's centre region (same geometry as the PIL render).
+    * Logo only: centred logo on the same pad.
+    * Label and logo: logo in the centre, label drawn in a white band
+      directly under the QR pattern.
+
+    Error correction is bumped to ``ERROR_CORRECT_H`` whenever a logo
+    or centre-label is present, mirroring :func:`generate_qr`.
+    """
+    centre_label = label is not None and logo is None
+    qr = _build_qr_for_render_plan(
+        data, template_id, logo, label, box_size, border,
+    )
+    modules = qr.modules
+    if modules is None:  # pragma: no cover - defensive (qr.make sets it)
+        raise RuntimeError("qrcode.QRCode.make did not populate modules")
+    modules_count = qr.modules_count
+
+    spec_id = template_id if template_id is not None else "default"
+    template = get_template(spec_id)
+    spec = template["spec"]
+    is_default = _is_default_template(template_id)
+
+    drawer_kind = spec["module_drawer_kind"]
+    qr_side = (modules_count + 2 * border) * box_size
+    qr_w = qr_side
+    qr_h = qr_side
+
+    # Band-below layout extends the canvas height. Use the same maths
+    # as the PIL render so the SVG and PNG layouts stay visually
+    # aligned even though the SVG label is rendered by the browser.
+    band_h = 0
+    pad_y = 0
+    font_size = 0
+    if label is not None and logo is not None:
+        font_size = max(14, qr_h * 12 // 100)
+        pad_y = max(box_size, font_size // 2)
+        band_h = font_size + 2 * pad_y
+    canvas_w = qr_w
+    canvas_h = qr_h + band_h
+
+    # Fill colour and gradient defs for the on-modules <g>.
+    fg_color: tuple[int, int, int]
+    if is_default:
+        defs_markup = ""
+        fill_attr = _svg_color_attr((0, 0, 0))
+        fg_color = (0, 0, 0)
+    else:
+        defs_markup, fill_attr = _build_svg_color_def(spec, qr_w, qr_h)
+        fg_color = _label_color_from_spec(spec)
+
+    parts: list[str] = []
+    parts.append('<?xml version="1.0" encoding="UTF-8" standalone="no"?>')
+    # Use the modern ``href`` attribute on <image> (no xmlns:xlink
+    # needed); see docstring for the compatibility rationale.
+    parts.append(
+        f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'viewBox="0 0 {canvas_w} {canvas_h}" '
+        f'width="{canvas_w}" height="{canvas_h}" '
+        f'shape-rendering="crispEdges">'
+    )
+    if defs_markup:
+        parts.append(defs_markup)
+    parts.append(
+        _render_modules_svg(modules, border, box_size, drawer_kind, fill_attr)
+    )
+
+    # Centre badge / logo overlay.
+    if logo is not None:
+        # Overlay the padded logo as a base64 PNG. The pad is the same
+        # white rounded-square the PIL render builds, so the SVG and
+        # PNG outputs match visually.
+        padded = _pad_logo(logo, LOGO_WORK_SIZE)
+        png_buf = io.BytesIO()
+        padded.save(png_buf, format="PNG")
+        encoded = base64.b64encode(png_buf.getvalue()).decode("ascii")
+        ratio = 0.22
+        side = qr_w * ratio
+        lx = (qr_w - side) / 2.0
+        ly = (qr_h - side) / 2.0
+        parts.append(
+            f'<image href="data:image/png;base64,{encoded}" '
+            f'x="{lx}" y="{ly}" width="{side}" height="{side}" '
+            f'preserveAspectRatio="xMidYMid meet"/>'
+        )
+    elif centre_label:
+        # Centre badge: rounded white pad + centred label glyph.
+        ratio = 0.22
+        badge_side = qr_w * ratio
+        bx = (qr_w - badge_side) / 2.0
+        by = (qr_h - badge_side) / 2.0
+        radius = max(2.0, badge_side / 8.0)
+        parts.append(
+            f'<rect x="{bx}" y="{by}" width="{badge_side}" height="{badge_side}" '
+            f'rx="{radius}" ry="{radius}" fill="rgb(255, 255, 255)"/>'
+        )
+        glyph_color = (0, 0, 0) if is_default else fg_color
+        glyph_size = _autofit_centre_badge_font_size(label, badge_side)
+        # SVG uses the badge's pixel side as the autofit target so the
+        # rendered glyph has the same proportions as the PIL render.
+        cx = qr_w / 2.0
+        cy = qr_h / 2.0
+        escaped = xml.sax.saxutils.escape(label)
+        parts.append(
+            f'<text x="{cx}" y="{cy}" '
+            f'font-family="Plus Jakarta Sans, sans-serif" font-weight="700" '
+            f'font-size="{glyph_size}" '
+            f'fill="{_svg_color_attr(glyph_color)}" '
+            f'text-anchor="middle" dominant-baseline="central">'
+            f"{escaped}</text>"
+        )
+
+    # Band-below layout: white band rect + centred label.
+    if label is not None and logo is not None:
+        parts.append(
+            f'<rect x="0" y="{qr_h}" width="{qr_w}" height="{band_h}" '
+            f'fill="rgb(255, 255, 255)"/>'
+        )
+        text_y = qr_h + band_h / 2.0
+        escaped = xml.sax.saxutils.escape(label)
+        parts.append(
+            f'<text x="{qr_w / 2.0}" y="{text_y}" '
+            f'font-family="Plus Jakarta Sans, sans-serif" font-weight="700" '
+            f'font-size="{font_size}" '
+            f'fill="{_svg_color_attr(fg_color)}" '
+            f'text-anchor="middle" dominant-baseline="central">'
+            f"{escaped}</text>"
+        )
+
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def generate_sequence_svg(
+    start: int,
+    count: int | None = None,
+    end: int | None = None,
+    data_template: str = "{n}",
+    label_template: str | None = "{n}",
+    padding: int = 0,
+    prefix: str = "",
+    box_size: int = 10,
+    border: int = 4,
+    template_id: str | None = None,
+    logo: Image.Image | None = None,
+) -> Iterator[tuple[str, str]]:
+    """Yield ``(filename, svg_string)`` pairs for a sequential range.
+
+    Mirrors :func:`generate_sequence` but emits SVG strings instead of
+    PIL images. The filename extension is ``.svg``. ``data_template``
+    and ``label_template`` follow the same ``str.replace`` semantics:
+    ``{n}`` is substituted with the padded numeric string, all other
+    text is literal.
+    """
+    numbers = compute_range(start, count=count, end=end, padding=padding)
+    for n in numbers:
+        data = data_template.replace("{n}", n)
+        label = label_template.replace("{n}", n) if label_template is not None else None
+        svg = generate_qr_svg(
+            data,
+            label=label,
+            box_size=box_size,
+            border=border,
+            template_id=template_id,
+            logo=logo,
+        )
+        yield f"{prefix}{n}.svg", svg
+
+
+def generate_sequence_render_plan(
+    start: int,
+    count: int | None = None,
+    end: int | None = None,
+    data_template: str = "{n}",
+    label_template: str | None = "{n}",
+    padding: int = 0,
+    prefix: str = "",
+    box_size: int = 10,
+    border: int = 4,
+    template_id: str | None = None,
+    logo: Image.Image | None = None,
+) -> Iterator[tuple[str, dict]]:
+    """Yield ``(filename_no_ext, render_plan)`` pairs for a sequential range.
+
+    A render plan is a dict carrying everything :func:`_pack_pdf_vector`
+    needs to draw a single QR using reportlab primitives directly:
+
+    * ``modules``: NxN bool matrix (from ``qr.modules``) of on-module flags.
+    * ``modules_count``: side length in modules.
+    * ``border``: quiet-zone width in modules.
+    * ``box_size``: pixel size per module (used for the SVG layout
+      contract; the PDF path scales modules into the page cell so
+      this is informational on the PDF side).
+    * ``spec``: resolved template spec dict (always populated, with
+      the ``default`` template's spec when no template is supplied).
+    * ``is_default``: True when no template / the ``default`` template
+      was selected, so the PDF path uses pure black for module fill
+      and label text.
+    * ``logo``: optional pre-padded RGBA :class:`PIL.Image.Image`.
+    * ``label``: optional label string.
+    * ``centre_label``: True when ``label`` is set without a ``logo``.
+    * ``label_color``: representative RGB tuple for the label.
+
+    Iterated lazily so peak memory stays at one render plan at a time
+    (one ``qrcode.QRCode`` instance plus, optionally, one padded logo).
+    """
+    numbers = compute_range(start, count=count, end=end, padding=padding)
+    spec_id = template_id if template_id is not None else "default"
+    template = get_template(spec_id)
+    spec = template["spec"]
+    is_default = _is_default_template(template_id)
+    if is_default:
+        label_color: tuple[int, int, int] = (0, 0, 0)
+    else:
+        label_color = _label_color_from_spec(spec)
+
+    # The padded logo is the same for every item in the sequence; build
+    # it once and reuse so we do not pay the LANCZOS resize per item.
+    padded_logo = _pad_logo(logo, LOGO_WORK_SIZE) if logo is not None else None
+
+    for n in numbers:
+        data = data_template.replace("{n}", n)
+        label = label_template.replace("{n}", n) if label_template is not None else None
+        qr = _build_qr_for_render_plan(
+            data, template_id, logo, label, box_size, border,
+        )
+        plan = {
+            "modules": qr.modules,
+            "modules_count": qr.modules_count,
+            "border": border,
+            "box_size": box_size,
+            "spec": spec,
+            "is_default": is_default,
+            "logo": padded_logo,
+            "label": label,
+            "centre_label": label is not None and logo is None,
+            "label_color": label_color,
+        }
+        yield f"{prefix}{n}", plan
+
+
+def _pack_zip_svg(items: Iterable[tuple[str, str]]) -> Iterator[tuple]:
+    """Pack ``(filename, svg_string)`` pairs into a ZIP archive in memory.
+
+    Mirrors :func:`_pack_zip` but writes SVG XML strings (UTF-8 encoded)
+    rather than PNG bytes. Yields ``("progress", index, filename)``
+    after each entry and ``("result", zip_bytes)`` exactly once at the
+    end. Items are pulled lazily so peak memory stays at one SVG
+    string plus the growing archive bytes.
+    """
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for index, (filename, svg) in enumerate(items):
+            zf.writestr(filename, svg.encode("utf-8"))
+            yield ("progress", index, filename)
+    yield ("result", buffer.getvalue())
+
+
+def _pack_pdf_vector(
+    items: Iterable[tuple[str, dict]],
+    page_size: tuple[float, float] = LETTER,
+    cols: int = 3,
+    rows: int = 4,
+    margin_pt: float = 36.0,
+) -> Iterator[tuple]:
+    """Pack a sequence of render plans onto a PDF using vector primitives.
+
+    Each on-module is drawn as a reportlab ``rect`` / ``circle`` /
+    ``roundRect`` directly into the canvas's content stream so the
+    resulting PDF stays vector and zoom-clean. No raster image XObject
+    is added unless the render plan carries a ``logo`` (the small
+    centre region is embedded as a raster trade-off, matching the SVG
+    path).
+
+    Gradient masks are simplified to a single representative colour
+    (``label_color``) on the PDF path. Full vector gradients via
+    ``c.linearGradient`` / ``c.radialGradient`` are possible but add
+    complexity; the user's primary complaint is pixelation, not
+    colour fidelity at zoom, and the simplification keeps the PDF
+    body small. The SVG path renders gradients fully via
+    ``<linearGradient>`` / ``<radialGradient>`` defs.
+
+    Yields ``("progress", index, filename)`` after each render and
+    ``("result", pdf_bytes)`` exactly once at the end.
+    """
+    if cols <= 0 or rows <= 0:
+        raise ValueError("cols and rows must both be > 0")
+
+    buffer = io.BytesIO()
+    page_w, page_h = page_size
+    usable_w = page_w - 2 * margin_pt
+    usable_h = page_h - 2 * margin_pt
+    cell_w = usable_w / cols
+    cell_h = usable_h / rows
+
+    # Disable page compression so the raw rectangle operator (``re``) and
+    # the QR module geometry remain inspectable in the PDF body. The
+    # vector contract test (``test_pack_pdf_vector_no_image_xobjects_for_no_logo_batch``)
+    # asserts on the substring ``b' re'`` to confirm rectangle drawing
+    # actually happened; with default compression the content stream is
+    # FlateDecode'd and the test would have to re-implement decoding.
+    # The compression saving is a few KB per page on a vector QR; the
+    # readability win for tests is worth the trade-off.
+    c = pdf_canvas.Canvas(buffer, pagesize=page_size, pageCompression=0)
+    per_page = cols * rows
+    for index, (filename, plan) in enumerate(items):
+        slot = index % per_page
+        if index > 0 and slot == 0:
+            c.showPage()
+
+        col_idx = slot % cols
+        row_idx = slot // cols
+
+        modules = plan["modules"]
+        modules_count = plan["modules_count"]
+        border = plan["border"]
+        spec = plan["spec"]
+        is_default = plan["is_default"]
+        logo = plan["logo"]
+        label = plan["label"]
+        centre_label = plan["centre_label"]
+        label_color = plan["label_color"]
+
+        # Compute the QR pixel-side and band layout so the cell-fit
+        # scaling preserves the SVG/PNG layout proportions.
+        qr_modules_side = modules_count + 2 * border
+        # Pick a working "module unit" of 1 PDF point per module before
+        # scaling: the actual scale is determined by cell-fit below.
+        unit = 1.0
+        qr_side = qr_modules_side * unit
+        # Band height (band-below layout when label + logo) follows the
+        # PIL render's proportions: ~12% of the QR pixel height plus
+        # 2 * pad_y where pad_y >= unit.
+        band_h = 0.0
+        font_size_px = 0.0
+        if label is not None and logo is not None:
+            font_size_px = max(14, int(qr_side * 12 // 100))
+            pad_y = max(unit, font_size_px / 2.0)
+            band_h = font_size_px + 2 * pad_y
+        total_w = qr_side
+        total_h = qr_side + band_h
+
+        scale = min(cell_w / total_w, cell_h / total_h)
+        draw_w = total_w * scale
+        draw_h = total_h * scale
+
+        cell_left = margin_pt + col_idx * cell_w
+        # Reportlab origin is bottom-left; we want row 0 at the top.
+        cell_bottom = page_h - margin_pt - (row_idx + 1) * cell_h
+        x0 = cell_left + (cell_w - draw_w) / 2
+        # The QR's top-left pixel sits at the top of the cell after
+        # centring; convert to PDF coordinates (bottom-left origin).
+        y_top = cell_bottom + (cell_h - draw_h) / 2 + draw_h
+        # The QR pattern occupies the top of the cell; the band sits
+        # below it. Compute the QR's bottom-left in PDF coords.
+        qr_pdf_w = qr_side * scale
+        qr_pdf_h = qr_side * scale
+        qr_y0 = y_top - qr_pdf_h
+        band_pdf_h = band_h * scale
+
+        # Module fill colour: representative stop for non-default templates,
+        # pure black for default. Gradient masks render as a single
+        # representative colour on the PDF path; see docstring.
+        if is_default:
+            module_color = (0, 0, 0)
+        else:
+            module_color = label_color
+        c.setFillColorRGB(
+            module_color[0] / 255.0,
+            module_color[1] / 255.0,
+            module_color[2] / 255.0,
+        )
+        c.setStrokeColorRGB(0, 0, 0)
+
+        drawer_kind = spec["module_drawer_kind"]
+        # Per-module pixel size in PDF points after scaling.
+        module_pt = unit * scale
+        radius_pt = module_pt / 2.0
+        gap_inset = module_pt * 0.10 if drawer_kind == "gapped_square" else 0.0
+
+        def _module_xy(row: int, col: int) -> tuple[float, float]:
+            x = x0 + (border + col) * module_pt
+            # PDF y origin bottom-left: row 0 sits at the TOP of the QR.
+            y = qr_y0 + qr_pdf_h - (border + row + 1) * module_pt
+            return x, y
+
+        if drawer_kind == "vertical_bars":
+            for row_start, row_end, col in _merge_runs_vertical(modules):
+                x = x0 + (border + col) * module_pt
+                run_h = (row_end - row_start) * module_pt
+                # Top-most module of the run is row_start; convert.
+                y = qr_y0 + qr_pdf_h - (border + row_end) * module_pt
+                c.rect(x, y, module_pt, run_h, fill=1, stroke=0)
+        elif drawer_kind == "horizontal_bars":
+            for row, col_start, col_end in _merge_runs_horizontal(modules):
+                x = x0 + (border + col_start) * module_pt
+                y = qr_y0 + qr_pdf_h - (border + row + 1) * module_pt
+                run_w = (col_end - col_start) * module_pt
+                c.rect(x, y, run_w, module_pt, fill=1, stroke=0)
+        else:
+            for row, cells in enumerate(modules):
+                for col_idx2, on in enumerate(cells):
+                    if not on:
+                        continue
+                    x, y = _module_xy(row, col_idx2)
+                    if drawer_kind == "circle":
+                        c.circle(
+                            x + radius_pt,
+                            y + radius_pt,
+                            radius_pt,
+                            fill=1,
+                            stroke=0,
+                        )
+                    elif drawer_kind == "rounded":
+                        c.roundRect(
+                            x, y, module_pt, module_pt, radius_pt,
+                            fill=1, stroke=0,
+                        )
+                    elif drawer_kind == "gapped_square":
+                        c.rect(
+                            x + gap_inset,
+                            y + gap_inset,
+                            module_pt - 2 * gap_inset,
+                            module_pt - 2 * gap_inset,
+                            fill=1,
+                            stroke=0,
+                        )
+                    else:  # square (default)
+                        c.rect(x, y, module_pt, module_pt, fill=1, stroke=0)
+
+        # Logo (raster centre embed). The pad is built once per
+        # sequence in :func:`generate_sequence_render_plan` and reused
+        # here.
+        if logo is not None:
+            ratio = 0.22
+            side = qr_pdf_w * ratio
+            lx = x0 + (qr_pdf_w - side) / 2.0
+            ly = qr_y0 + (qr_pdf_h - side) / 2.0
+            c.drawImage(
+                ImageReader(logo),
+                lx,
+                ly,
+                width=side,
+                height=side,
+                preserveAspectRatio=True,
+                mask="auto",
+            )
+
+        # Centre badge (label without logo): white rounded pad +
+        # centred glyph.
+        if centre_label and label is not None:
+            ratio = 0.22
+            badge_side = qr_pdf_w * ratio
+            bx = x0 + (qr_pdf_w - badge_side) / 2.0
+            by = qr_y0 + (qr_pdf_h - badge_side) / 2.0
+            c.setFillColorRGB(1, 1, 1)
+            c.roundRect(
+                bx, by, badge_side, badge_side, badge_side / 8.0,
+                fill=1, stroke=0,
+            )
+            # Glyph colour follows the template (or pure black for default).
+            if is_default:
+                glyph_color = (0, 0, 0)
+            else:
+                glyph_color = label_color
+            c.setFillColorRGB(
+                glyph_color[0] / 255.0,
+                glyph_color[1] / 255.0,
+                glyph_color[2] / 255.0,
+            )
+            # Autofit on the badge's pixel side; reuse the SVG/PIL
+            # autofit so the rendered glyph proportions match.
+            font_size_pt = _autofit_centre_badge_font_size(label, badge_side)
+            try:
+                c.setFont(_PDF_LABEL_FONT_NAME, font_size_pt)
+            except KeyError:  # pragma: no cover - registration failed at import
+                c.setFont("Helvetica-Bold", font_size_pt)
+            text_x = bx + badge_side / 2.0
+            # ``drawCentredString`` aligns at the text baseline, so
+            # offset the y to roughly the badge's vertical centre.
+            text_y = by + badge_side / 2.0 - font_size_pt * 0.35
+            c.drawCentredString(text_x, text_y, label)
+
+        # Band-below layout: white band + centred label glyph.
+        if label is not None and logo is not None:
+            band_y = qr_y0 - band_pdf_h
+            c.setFillColorRGB(1, 1, 1)
+            c.rect(x0, band_y, qr_pdf_w, band_pdf_h, fill=1, stroke=0)
+            if is_default:
+                glyph_color = (0, 0, 0)
+            else:
+                glyph_color = label_color
+            c.setFillColorRGB(
+                glyph_color[0] / 255.0,
+                glyph_color[1] / 255.0,
+                glyph_color[2] / 255.0,
+            )
+            font_size_pt = font_size_px * scale
+            try:
+                c.setFont(_PDF_LABEL_FONT_NAME, font_size_pt)
+            except KeyError:  # pragma: no cover - registration failed at import
+                c.setFont("Helvetica-Bold", font_size_pt)
+            text_x = x0 + qr_pdf_w / 2.0
+            text_y = band_y + band_pdf_h / 2.0 - font_size_pt * 0.35
+            c.drawCentredString(text_x, text_y, label)
+
+        yield ("progress", index, filename)
+
+    c.showPage()
+    c.save()
+    yield ("result", buffer.getvalue())
+
+
+def iter_batch_vector_with_progress(
+    items: Iterable,
+    fmt: str,
+) -> Iterator[tuple]:
+    """Vector-batch counterpart to :func:`iter_batch_with_progress`.
+
+    Routes ``fmt='zip_svg'`` to :func:`_pack_zip_svg` (SVG entries) and
+    ``fmt='pdf'`` to :func:`_pack_pdf_vector` (vector PDF). The HTTP
+    layer is responsible for handing this iterator the right kind of
+    items: SVG strings (filename, svg) for zip_svg, render plans
+    (filename_no_ext, plan) for pdf. Anything else raises
+    :class:`ValueError`.
+
+    The event shape is unchanged from the raster
+    :func:`iter_batch_with_progress`: ``("progress", index, name)`` per
+    item plus a single terminal ``("result", payload_bytes)``.
+    """
+    if fmt == "zip_svg":
+        yield from _pack_zip_svg(items)
+    elif fmt == "pdf":
+        yield from _pack_pdf_vector(items)
+    else:
+        raise ValueError("fmt must be 'zip_svg' or 'pdf'")

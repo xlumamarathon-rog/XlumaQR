@@ -308,12 +308,16 @@
           <fieldset class="row format-toggle">
             <legend>Download format</legend>
             <label>
-              <input type="radio" name="format" value="zip" checked />
-              ZIP (one PNG per code)
+              <input type="radio" name="format" value="zip_svg" checked />
+              ZIP (SVG vectors, no pixelation)
+            </label>
+            <label>
+              <input type="radio" name="format" value="zip" />
+              ZIP (one PNG per code, legacy)
             </label>
             <label>
               <input type="radio" name="format" value="pdf" />
-              PDF (grid layout)
+              PDF (vector grid layout)
             </label>
           </fieldset>
 

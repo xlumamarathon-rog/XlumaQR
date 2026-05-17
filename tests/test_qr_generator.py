@@ -1090,3 +1090,238 @@ def test_label_centre_badge_at_small_box_size_carries_template_colour() -> None:
         f"centre badge must not contain any pure-black pixels for a "
         f"templated render; got {black}"
     )
+
+
+# --- Vector downloads (FEAT-002) -----------------------------------
+
+
+def test_generate_qr_svg_returns_svg_root_with_no_background_rect() -> None:
+    """The SVG output must be well-formed XML with a transparent
+    background. Specifically: no ``<rect>`` element whose width and
+    height span the whole canvas, since that would re-introduce the
+    solid-white background the user complained about.
+    """
+    import xml.etree.ElementTree as ET
+
+    from qr_generator import generate_qr_svg
+
+    svg = generate_qr_svg("hello")
+    assert isinstance(svg, str)
+
+    head = svg.lstrip()
+    assert head.startswith("<?xml") or head.startswith("<svg")
+
+    # Well-formed XML.
+    root = ET.fromstring(svg)
+    # Strip the namespace prefix off the localname so the rect search
+    # below can match against the local element name.
+    ns = "{http://www.w3.org/2000/svg}"
+    assert root.tag == f"{ns}svg"
+
+    width_attr = root.attrib.get("width", "")
+    height_attr = root.attrib.get("height", "")
+
+    # Walk every <rect> in the document and assert none of them spans
+    # the full canvas. We accept either pixel-equal or 100%-style
+    # coverage as a "background rect".
+    for rect in root.iter(f"{ns}rect"):
+        rw = rect.attrib.get("width", "")
+        rh = rect.attrib.get("height", "")
+        rx = rect.attrib.get("x", "0")
+        ry = rect.attrib.get("y", "0")
+        spans_full_canvas = (
+            rx in {"0", "0.0"}
+            and ry in {"0", "0.0"}
+            and rw == width_attr
+            and rh == height_attr
+        )
+        spans_full_via_percent = rw == "100%" and rh == "100%"
+        assert not spans_full_canvas, (
+            f"found a full-canvas <rect> at ({rx}, {ry}) sized "
+            f"{rw}x{rh}; the SVG must keep a transparent background"
+        )
+        assert not spans_full_via_percent, (
+            "found a 100%x100% <rect>; the SVG must keep a "
+            "transparent background"
+        )
+
+
+def test_generate_qr_svg_module_count_matches_active_modules() -> None:
+    """For the default template (square module drawer) the SVG must
+    contain exactly one ``<rect>`` per on-module. We measure the
+    on-module count independently via a fresh ``qrcode.QRCode`` and
+    only count rects whose ``width`` attribute equals ``box_size`` so
+    the optional logo/label rects are excluded."""
+    import xml.etree.ElementTree as ET
+
+    import qrcode as _qr
+
+    from qr_generator import generate_qr_svg
+
+    box_size = 10
+    border = 4
+    qr = _qr.QRCode(box_size=box_size, border=border)
+    qr.add_data("hello")
+    qr.make(fit=True)
+    expected = sum(1 for row in qr.modules for cell in row if cell)
+
+    svg = generate_qr_svg("hello", box_size=box_size, border=border)
+    root = ET.fromstring(svg)
+    ns = "{http://www.w3.org/2000/svg}"
+
+    rects = [
+        r for r in root.iter(f"{ns}rect")
+        if r.attrib.get("width") == str(box_size)
+        and r.attrib.get("height") == str(box_size)
+    ]
+    assert len(rects) == expected, (
+        f"expected {expected} module rects, got {len(rects)}"
+    )
+
+
+def test_generate_qr_svg_solid_template_uses_front_color() -> None:
+    """``running-track`` is a solid red template with
+    ``front_color=(211, 47, 47)``. The SVG must reference that colour
+    on the on-module ``<g fill=...>``."""
+    from qr_generator import generate_qr_svg
+
+    svg = generate_qr_svg("hello", template_id="running-track")
+    # Accept either ``rgb(211, 47, 47)`` or ``rgb(211,47,47)`` (any
+    # whitespace style) so the test does not over-fit the formatting.
+    assert (
+        'fill="rgb(211, 47, 47)"' in svg
+        or 'fill="rgb(211,47,47)"' in svg
+    )
+
+
+def test_generate_qr_svg_radial_gradient_template_emits_radial_def() -> None:
+    """``marathon-fire`` uses a radial gradient mask. The SVG must
+    emit a ``<radialGradient>`` def and the on-module ``<g>`` must
+    reference it via ``url(#...)``."""
+    from qr_generator import generate_qr_svg
+
+    svg = generate_qr_svg("hello", template_id="marathon-fire")
+    assert "<radialGradient" in svg
+    assert 'fill="url(#' in svg
+
+
+def test_generate_qr_svg_with_logo_embeds_base64_image() -> None:
+    """When a logo is supplied the SVG embeds it as a base64 PNG data
+    URI inside an ``<image>`` element. The QR pattern around the logo
+    stays vector; the trade-off is documented in the function's
+    docstring."""
+    from qr_generator import generate_qr_svg
+
+    logo = Image.new("RGB", (64, 64), (255, 165, 0))
+    svg = generate_qr_svg("hello", logo=logo)
+    assert "<image" in svg
+    assert "data:image/png;base64," in svg
+
+
+def test_generate_qr_svg_with_label_no_logo_has_centre_text() -> None:
+    """Centre-badge layout: label without logo emits a ``<text>``
+    element with ``text-anchor="middle"`` and the literal label
+    text."""
+    from qr_generator import generate_qr_svg
+
+    svg = generate_qr_svg("hello", label="42")
+    assert "<text" in svg
+    assert ">42<" in svg
+    assert 'text-anchor="middle"' in svg
+
+
+def test_generate_qr_svg_label_with_logo_extends_viewbox_height() -> None:
+    """Band-below layout: label with a logo extends the SVG height
+    beyond its width to accommodate the band."""
+    import xml.etree.ElementTree as ET
+
+    from qr_generator import generate_qr_svg
+
+    logo = Image.new("RGB", (32, 32), (255, 165, 0))
+    svg = generate_qr_svg("hello", label="42", logo=logo)
+    root = ET.fromstring(svg)
+    viewbox = root.attrib.get("viewBox", "")
+    parts = viewbox.split()
+    assert len(parts) == 4
+    _, _, w, h = parts
+    assert float(h) > float(w), (
+        f"viewBox height {h} should exceed width {w} for band-below layout"
+    )
+
+
+def test_generate_qr_svg_label_is_xml_escaped() -> None:
+    """User-supplied label text containing XML-special characters
+    must be escaped before being embedded in the SVG, so the output
+    stays well-formed XML."""
+    import xml.etree.ElementTree as ET
+
+    from qr_generator import generate_qr_svg
+
+    svg = generate_qr_svg("hello", label="<script>&'\"")
+    # Well-formed XML even with unsafe characters in the label.
+    root = ET.fromstring(svg)
+    assert root.tag.endswith("svg")
+    # The literal ``<script>`` token (with its angle brackets) must
+    # NOT appear in the output: it would reopen as an element. The
+    # escaped form (``&lt;script&gt;``) is what the parser would
+    # serialise back to, but ``ET.fromstring`` succeeds either way.
+    assert "<script>" not in svg
+
+
+def test_pack_pdf_vector_no_image_xobjects_for_no_logo_batch() -> None:
+    """With no logo every QR module is drawn as a reportlab vector
+    primitive, so the PDF body contains zero image XObjects.
+
+    The PDF spec writes the dictionary as ``/Subtype /Image`` (with a
+    space) by default in reportlab, but other producers may use
+    ``/Subtype/Image`` (no space). We sum both substrings to be robust
+    against either form. We also confirm the body contains the
+    rectangle path operator (``b' re '``) so we know modules really
+    were drawn as vector rects rather than bypassed entirely."""
+    from qr_generator import _pack_pdf_vector, generate_sequence_render_plan
+
+    plans = list(
+        generate_sequence_render_plan(start=1, count=3, padding=2, prefix="")
+    )
+    events = list(_pack_pdf_vector(iter(plans)))
+    result = [e for e in events if e[0] == "result"][0]
+    body = result[1]
+    assert body.startswith(b"%PDF-")
+
+    image_xobjects = body.count(b"/Subtype /Image") + body.count(b"/Subtype/Image")
+    assert image_xobjects == 0, (
+        f"expected zero image XObjects in a no-logo vector PDF batch, "
+        f"got {image_xobjects}"
+    )
+    # ``re`` is the PDF rectangle path operator that ``c.rect`` emits.
+    rect_ops = body.count(b" re\n") + body.count(b" re ")
+    assert rect_ops > 0, (
+        "expected the PDF content stream to contain rectangle path "
+        "operators; the modules may not have been drawn as vector"
+    )
+
+
+def test_pack_pdf_vector_logo_batch_has_at_most_one_image_xobject_per_qr() -> None:
+    """When a logo is supplied, the centre region is embedded as a
+    raster (small region trade-off documented in :func:`_pack_pdf_vector`).
+    The image XObject count must equal the batch size: one per QR for
+    the centre logo, not one per page worth of modules."""
+    from qr_generator import _pack_pdf_vector, generate_sequence_render_plan
+
+    logo = Image.new("RGB", (64, 64), (255, 165, 0))
+    plans = list(
+        generate_sequence_render_plan(
+            start=1, count=3, padding=2, prefix="", logo=logo,
+        )
+    )
+    events = list(_pack_pdf_vector(iter(plans)))
+    result = [e for e in events if e[0] == "result"][0]
+    body = result[1]
+    image_xobjects = body.count(b"/Subtype /Image") + body.count(b"/Subtype/Image")
+    # reportlab may dedupe identical embedded images; the contract is
+    # "at most one per QR", not "exactly N". With a shared padded logo
+    # reused across the batch reportlab emits a single image XObject.
+    assert 1 <= image_xobjects <= 3, (
+        f"expected 1..3 image XObjects (one per QR upper bound), "
+        f"got {image_xobjects}"
+    )
