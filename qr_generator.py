@@ -2238,12 +2238,13 @@ def _pack_pdf_vector(
         # scaling: the actual scale is determined by cell-fit below.
         unit = 1.0
         qr_side = qr_modules_side * unit
-        # Band height (band-below layout when label + logo) follows the
-        # PIL render's proportions: ~12% of the QR pixel height plus
-        # 2 * pad_y where pad_y >= unit.
+        # Band height (band-below layout) follows the PIL render's
+        # proportions: ~12% of the QR pixel height plus 2 * pad_y
+        # where pad_y >= unit. Always allocate band space when a label
+        # is present so the label never overlaps the QR pattern.
         band_h = 0.0
         font_size_px = 0.0
-        if label is not None and logo is not None:
+        if label is not None:
             font_size_px = max(14, int(qr_side * 12 // 100))
             pad_y = max(unit, font_size_px / 2.0)
             band_h = font_size_px + 2 * pad_y
@@ -2356,19 +2357,19 @@ def _pack_pdf_vector(
                 mask="auto",
             )
 
-        # Centre badge (label without logo): white rounded pad +
-        # centred glyph.
+        # Centre badge (label without logo): for print clarity, render
+        # the label in a band below the QR rather than overlaid on it.
+        # This ensures the QR pattern remains fully scannable at any
+        # print size. The screen preview uses a centre badge for visual
+        # appeal, but the downloaded PDF prioritises scannability.
         if centre_label and label is not None:
-            ratio = 0.22
-            badge_side = qr_pdf_w * ratio
-            bx = x0 + (qr_pdf_w - badge_side) / 2.0
-            by = qr_y0 + (qr_pdf_h - badge_side) / 2.0
+            # Draw a white band below the QR and place the label there
+            font_size_px = max(14, int(qr_side * 12 // 100))
+            pad_y = max(unit, font_size_px / 2.0)
+            band_h_local = (font_size_px + 2 * pad_y) * scale
+            band_y = qr_y0 - band_h_local
             c.setFillColorRGB(1, 1, 1)
-            c.roundRect(
-                bx, by, badge_side, badge_side, badge_side / 8.0,
-                fill=1, stroke=0,
-            )
-            # Glyph colour follows the template (or pure black for default).
+            c.rect(x0, band_y, qr_pdf_w, band_h_local, fill=1, stroke=0)
             if is_default:
                 glyph_color = (0, 0, 0)
             else:
@@ -2378,17 +2379,13 @@ def _pack_pdf_vector(
                 glyph_color[1] / 255.0,
                 glyph_color[2] / 255.0,
             )
-            # Autofit on the badge's pixel side; reuse the SVG/PIL
-            # autofit so the rendered glyph proportions match.
-            font_size_pt = _autofit_centre_badge_font_size(label, badge_side)
+            font_size_pt = font_size_px * scale
             try:
                 c.setFont(_PDF_LABEL_FONT_NAME, font_size_pt)
-            except KeyError:  # pragma: no cover - registration failed at import
+            except KeyError:  # pragma: no cover
                 c.setFont("Helvetica-Bold", font_size_pt)
-            text_x = bx + badge_side / 2.0
-            # ``drawCentredString`` aligns at the text baseline, so
-            # offset the y to roughly the badge's vertical centre.
-            text_y = by + badge_side / 2.0 - font_size_pt * 0.35
+            text_x = x0 + qr_pdf_w / 2.0
+            text_y = band_y + band_h_local / 2.0 - font_size_pt * 0.35
             c.drawCentredString(text_x, text_y, label)
 
         # Band-below layout: white band + centred label glyph.
@@ -2512,8 +2509,6 @@ def generate_qr_eps(
 
     canvas_w = qr_side
     canvas_h = qr_side + label_band_h
-
-    # Build EPS
     lines: list[str] = []
     lines.append("%!PS-Adobe-3.0 EPSF-3.0")
     lines.append(f"%%BoundingBox: 0 0 {canvas_w} {canvas_h}")
@@ -2587,20 +2582,24 @@ def generate_qr_eps(
             lines.append(hex_data[i:i+72])
         lines.append("grestore")
 
-    # Draw label text
+    # Draw label text — always in the band below the QR for print clarity.
+    # Unlike the screen preview (which uses a centre badge when no logo is
+    # present), the EPS print output always places the label below the QR
+    # so it never obscures any modules and the code remains scannable.
     if label is not None:
         font_size = max(14, qr_side * 12 // 100)
-        if logo is not None:
-            # Label in band below QR
-            text_y = label_band_h // 2 - font_size // 3
-        else:
-            # Centre badge label
-            text_y = canvas_h // 2 - font_size // 3
+        # Label in band below QR (PostScript origin is bottom-left,
+        # so the band occupies y=0..label_band_h)
+        text_y = label_band_h // 2 - font_size // 3
 
+        # Draw white background for the label band
         lines.append("")
+        lines.append("1 1 1 setrgbcolor")
+        lines.append(f"0 0 {canvas_w} {label_band_h} rectfill")
+
         lines.append(f"{r/255:.4f} {g/255:.4f} {b/255:.4f} setrgbcolor")
         lines.append(f"/Helvetica-Bold findfont {font_size} scalefont setfont")
-        # Centre the text
+        # Centre the text horizontally
         escaped_label = label.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
         lines.append(f"({escaped_label}) dup stringwidth pop")
         lines.append(f"{canvas_w} exch sub 2 div {text_y} moveto")
