@@ -1321,6 +1321,7 @@ def generate_sequence(
 
 def _pack_zip(
     items: Iterable[tuple[str, Image.Image]],
+    transparent: bool = True,
 ) -> Iterator[tuple]:
     """Pack ``items`` into a ZIP archive in memory, yielding progress.
 
@@ -1330,6 +1331,10 @@ def _pack_zip(
     events to the HTTP wire). Centralising the loop here keeps the
     archive-building logic in one place so the synchronous and
     streaming routes cannot drift.
+
+    When ``transparent=True`` (default), white backgrounds are converted
+    to transparent so the QR can be overlaid on designs without needing
+    manual background removal.
 
     Yields
     ------
@@ -1341,6 +1346,16 @@ def _pack_zip(
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         for index, (filename, image) in enumerate(items):
+            if transparent:
+                image = image.convert("RGBA")
+                datas = image.getdata()
+                new_data = []
+                for item in datas:
+                    if item[0] > 240 and item[1] > 240 and item[2] > 240:
+                        new_data.append((item[0], item[1], item[2], 0))
+                    else:
+                        new_data.append(item)
+                image.putdata(new_data)
             png_buf = io.BytesIO()
             image.save(png_buf, format="PNG")
             zf.writestr(filename, png_buf.getvalue())

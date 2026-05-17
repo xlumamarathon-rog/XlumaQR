@@ -536,6 +536,9 @@ def api_batch() -> Response:
             mimetype = "application/zip"
             filename = f"qr_batch_{first_n}_{last_n}_eps.zip"
         else:
+            # PNG batch: render at high resolution (box_size=40) for
+            # print quality. The user's box_size setting is overridden
+            # to ensure the output doesn't pixelate when printed.
             items = generate_sequence(
                 start=parsed["start"],
                 count=parsed["count"],
@@ -544,7 +547,7 @@ def api_batch() -> Response:
                 label_template=parsed["label_template"],
                 padding=parsed["padding"],
                 prefix=parsed["prefix"],
-                box_size=parsed["box_size"],
+                box_size=40,
                 border=parsed["border"],
                 template_id=parsed["template_id"],
                 logo=parsed["logo"],
@@ -775,6 +778,7 @@ def api_batch_stream() -> Response:
         items = None
         packer = _eps_packer
     else:
+        # PNG batch: render at high resolution (box_size=40) for print
         items = generate_sequence(
             start=parsed["start"],
             count=parsed["count"],
@@ -783,7 +787,7 @@ def api_batch_stream() -> Response:
             label_template=parsed["label_template"],
             padding=parsed["padding"],
             prefix=parsed["prefix"],
-            box_size=parsed["box_size"],
+            box_size=40,
             border=parsed["border"],
             template_id=parsed["template_id"],
             logo=parsed["logo"],
