@@ -75,6 +75,7 @@ __all__ = [
     "generate_qr_svg",
     "generate_qr_eps",
     "generate_qr_print_png",
+    "generate_pdf_single_page",
     "compute_range",
     "generate_sequence",
     "generate_sequence_svg",
@@ -2449,8 +2450,144 @@ def iter_batch_vector_with_progress(
         yield from _pack_zip_svg(items)
     elif fmt == "pdf":
         yield from _pack_pdf_vector(items)
+    elif fmt == "pdf_single":
+        yield from _pack_pdf_single_page(items)
     else:
-        raise ValueError("fmt must be 'zip_svg' or 'pdf'")
+        raise ValueError("fmt must be 'zip_svg', 'pdf', or 'pdf_single'")
+
+
+def _pack_pdf_single_page(
+    items: Iterable[tuple[str, dict]],
+) -> Iterator[tuple]:
+    """Render one QR per page in a vector PDF with transparent background.
+
+    Each page is sized exactly to the QR (plus label band if present),
+    with no white background fill. This produces a PDF that can be
+    placed as an overlay in InDesign, Illustrator, or Photoshop without
+    any background to remove.
+
+    Yields ``("progress", index, filename)`` after each page and
+    ``("result", pdf_bytes)`` exactly once at the end.
+    """
+    buffer = io.BytesIO()
+    c = None
+
+    for index, (filename, plan) in enumerate(items):
+        modules = plan["modules"]
+        modules_count = plan["modules_count"]
+        border = plan["border"]
+        spec = plan["spec"]
+        is_default = plan["is_default"]
+        logo = plan["logo"]
+        label = plan["label"]
+        centre_label = plan["centre_label"]
+        label_color = plan["label_color"]
+
+        # Page size = QR size + label band. Use 10 points per module
+        # for a good print size (~3-4 inches for typical QR).
+        pts_per_module = 10.0
+        qr_modules_side = modules_count + 2 * border
+        qr_side = qr_modules_side * pts_per_module
+
+        # Label band
+        band_h = 0.0
+        font_size_pt = 0.0
+        if label is not None:
+            font_size_pt = max(10.0, qr_side * 0.12)
+            pad_y = max(pts_per_module, font_size_pt * 0.4)
+            band_h = font_size_pt + 2 * pad_y
+
+        page_w = qr_side
+        page_h = qr_side + band_h
+
+        if c is None:
+            c = pdf_canvas.Canvas(buffer, pagesize=(page_w, page_h))
+        else:
+            c.showPage()
+            c.setPageSize((page_w, page_h))
+
+        # NO background fill — transparent page
+
+        # Module fill colour
+        if is_default:
+            module_color = (0, 0, 0)
+        else:
+            module_color = label_color
+        c.setFillColorRGB(
+            module_color[0] / 255.0,
+            module_color[1] / 255.0,
+            module_color[2] / 255.0,
+        )
+
+        drawer_kind = spec["module_drawer_kind"]
+        module_pt = pts_per_module
+        radius_pt = module_pt / 2.0
+
+        # Draw QR modules
+        for row, cells in enumerate(modules):
+            for col, on in enumerate(cells):
+                if not on:
+                    continue
+                x = (border + col) * module_pt
+                # PDF origin is bottom-left; row 0 at top
+                y = band_h + qr_side - (border + row + 1) * module_pt
+
+                if drawer_kind == "circle":
+                    c.circle(x + radius_pt, y + radius_pt, radius_pt, fill=1, stroke=0)
+                elif drawer_kind == "rounded":
+                    c.roundRect(x, y, module_pt, module_pt, radius_pt, fill=1, stroke=0)
+                elif drawer_kind == "gapped_square":
+                    inset = module_pt * 0.10
+                    c.rect(x + inset, y + inset, module_pt - 2*inset, module_pt - 2*inset, fill=1, stroke=0)
+                else:
+                    c.rect(x, y, module_pt, module_pt, fill=1, stroke=0)
+
+        # Logo (raster centre embed)
+        if logo is not None:
+            ratio = 0.22
+            side = qr_side * ratio
+            lx = (page_w - side) / 2.0
+            ly = band_h + (qr_side - side) / 2.0
+            c.drawImage(
+                ImageReader(logo), lx, ly,
+                width=side, height=side,
+                preserveAspectRatio=True, mask="auto",
+            )
+
+        # Label below QR
+        if label is not None:
+            if is_default:
+                glyph_color = (0, 0, 0)
+            else:
+                glyph_color = label_color
+            c.setFillColorRGB(
+                glyph_color[0] / 255.0,
+                glyph_color[1] / 255.0,
+                glyph_color[2] / 255.0,
+            )
+            try:
+                c.setFont(_PDF_LABEL_FONT_NAME, font_size_pt)
+            except KeyError:
+                c.setFont("Helvetica-Bold", font_size_pt)
+            text_x = page_w / 2.0
+            text_y = band_h / 2.0 - font_size_pt * 0.35
+            c.drawCentredString(text_x, text_y, label)
+
+        yield ("progress", index, filename)
+
+    if c is not None:
+        c.showPage()
+        c.save()
+    yield ("result", buffer.getvalue())
+
+
+def generate_pdf_single_page(items: Iterable[tuple[str, dict]]) -> bytes:
+    """Convenience wrapper: render one-QR-per-page PDF and return bytes."""
+    payload = b""
+    for token in _pack_pdf_single_page(items):
+        if token[0] == "result":
+            payload = token[1]
+    return payload
 
 
 # --- EPS (Encapsulated PostScript) export --------------------------------

@@ -485,6 +485,24 @@ def api_batch() -> Response:
             assert payload is not None
             mimetype = "application/pdf"
             filename = f"qr_batch_{first_n}_{last_n}.pdf"
+        elif fmt == "pdf_single":
+            plans = generate_sequence_render_plan(
+                start=parsed["start"],
+                count=parsed["count"],
+                end=parsed["end"],
+                data_template=parsed["data_template"],
+                label_template=parsed["label_template"],
+                padding=parsed["padding"],
+                prefix=parsed["prefix"],
+                box_size=parsed["box_size"],
+                border=parsed["border"],
+                template_id=parsed["template_id"],
+                logo=parsed["logo"],
+            )
+            from qr_generator import generate_pdf_single_page
+            payload = generate_pdf_single_page(plans)
+            mimetype = "application/pdf"
+            filename = f"qr_batch_{first_n}_{last_n}.pdf"
         elif fmt == "zip_svg":
             svg_items = generate_sequence_svg(
                 start=parsed["start"],
@@ -637,8 +655,8 @@ def _parse_batch_form() -> tuple[dict[str, Any] | None, str | None]:
         return None, f"label_template must be <= {MAX_DATA_LENGTH} characters"
 
     fmt = (request.form.get("format") or "zip").strip().lower()
-    if fmt not in {"zip", "zip_svg", "zip_eps", "pdf"}:
-        return None, "format must be 'zip', 'zip_svg', 'zip_eps', or 'pdf'"
+    if fmt not in {"zip", "zip_svg", "zip_eps", "pdf", "pdf_single"}:
+        return None, "format must be 'zip', 'zip_svg', 'zip_eps', 'pdf', or 'pdf_single'"
 
     # Validate the range up front so we can return a clean 400 before we
     # start rendering hundreds of QR codes.
@@ -699,7 +717,7 @@ def api_batch_stream() -> Response:
     first_n: str = parsed["first_n"]
     last_n: str = parsed["last_n"]
 
-    if fmt == "pdf":
+    if fmt == "pdf" or fmt == "pdf_single":
         mimetype = "application/pdf"
         filename = f"qr_batch_{first_n}_{last_n}.pdf"
     else:
@@ -724,7 +742,7 @@ def api_batch_stream() -> Response:
             logo=parsed["logo"],
         )
         packer = lambda src: iter_batch_vector_with_progress(src, "zip_svg")
-    elif fmt == "pdf":
+    elif fmt == "pdf" or fmt == "pdf_single":
         items = generate_sequence_render_plan(
             start=parsed["start"],
             count=parsed["count"],
@@ -738,7 +756,7 @@ def api_batch_stream() -> Response:
             template_id=parsed["template_id"],
             logo=parsed["logo"],
         )
-        packer = lambda src: iter_batch_vector_with_progress(src, "pdf")
+        packer = lambda src: iter_batch_vector_with_progress(src, fmt)
     elif fmt == "zip_eps":
         # EPS batch: generate EPS files and pack into a ZIP with progress
         numbers = compute_range(

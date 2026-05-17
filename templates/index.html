@@ -324,9 +324,15 @@
           <fieldset class="row format-toggle">
             <legend>Download format</legend>
             <label
+              title="One QR per page, vector, transparent background. Perfect for placing on bib designs in Photoshop/Illustrator/InDesign."
+            >
+              <input type="radio" name="format" value="pdf_single" checked />
+              PDF (1 QR per page, transparent, vector)
+            </label>
+            <label
               title="Each QR is a vector EPS file. Opens in Photoshop, Illustrator, InDesign. Perfect for marathon bib printing — no pixelation at any size."
             >
-              <input type="radio" name="format" value="zip_eps" checked />
+              <input type="radio" name="format" value="zip_eps" />
               ZIP (EPS vectors — Photoshop/Illustrator)
             </label>
             <label
@@ -336,22 +342,21 @@
               ZIP (SVG vectors, no pixelation)
             </label>
             <label
-              title="One PNG per QR. Legacy raster format; keeps the template's white background and pixelates on heavy zoom."
+              title="High-res transparent PNG per QR. Works in Photoshop."
             >
               <input type="radio" name="format" value="zip" />
-              ZIP (one PNG per code, legacy)
+              ZIP (PNG, transparent, high-res)
             </label>
             <label
-              title="Vector PDF grid layout with a transparent canvas. Stays sharp at any zoom. Note: gradient templates render as a single representative colour in PDF output; choose ZIP (SVG vectors) for full gradient fidelity."
+              title="Vector PDF grid layout (multiple QRs per page). Good for printing sheets."
             >
               <input type="radio" name="format" value="pdf" />
-              PDF (vector grid layout)
+              PDF (grid layout, multiple per page)
             </label>
             <p class="format-toggle-note hint">
-              EPS is recommended for print (marathon bibs). Opens
-              directly in Photoshop and Illustrator with no
-              pixelation. SVG and PDF are also vector but may not
-              open in Photoshop.
+              PDF (1 per page) is recommended for marathon bibs —
+              vector, transparent, one QR per page ready to place
+              on your bib design.
             </p>
           </fieldset>
 
