@@ -166,7 +166,7 @@
                 type="number"
                 id="batch-start"
                 name="start"
-                value="101"
+                placeholder="e.g. 101"
                 required
               />
             </div>
@@ -176,7 +176,7 @@
                 type="number"
                 id="batch-padding"
                 name="padding"
-                value="0"
+                placeholder="0"
                 min="0"
               />
             </div>
@@ -205,13 +205,18 @@
               type="number"
               id="batch-count"
               name="count"
-              value="100"
+              placeholder="e.g. 100"
               min="1"
             />
           </div>
           <div class="row" id="batch-end-row" hidden>
             <label for="batch-end">End</label>
-            <input type="number" id="batch-end" name="end" />
+            <input
+              type="number"
+              id="batch-end"
+              name="end"
+              placeholder="e.g. 200"
+            />
           </div>
 
           <div class="row">
@@ -352,7 +357,7 @@
 
           <div class="row">
             <p id="batch-hint" class="hint">
-              Will generate 100 QR codes: 101 -&gt; 200
+              Enter a start number and count to see the range.
             </p>
           </div>
 

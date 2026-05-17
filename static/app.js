@@ -947,16 +947,16 @@
     var lastN;
 
     if (isNaN(startVal)) {
-      batchHint.textContent = "Enter a start number to see the range.";
-      batchHint.classList.add("error");
+      batchHint.textContent = "Enter a start number and count to see the range.";
+      batchHint.classList.remove("error");
       return;
     }
 
     if (mode === "count") {
       count = parseInt(batchForm.elements["count"].value || "", 10);
       if (isNaN(count) || count <= 0) {
-        batchHint.textContent = "Count must be a positive integer.";
-        batchHint.classList.add("error");
+        batchHint.textContent = "Enter a count to see the range.";
+        batchHint.classList.remove("error");
         return;
       }
       lastN = startVal + count - 1;
