@@ -1664,9 +1664,10 @@ def test_batch_format_pdf_is_vector(client) -> None:
     )
     per_page = 4 * 3
     expected_pages = math.ceil(count / per_page)
-    assert body.count(b"/Type /Page") >= expected_pages, (
+    page_marker_count = body.count(b"/Type /Page\n")
+    assert page_marker_count >= expected_pages, (
         f"expected at least {expected_pages} ``/Type /Page`` references "
-        f"in the PDF body, got {body.count(b'/Type /Page')}"
+        f"in the PDF body, got {page_marker_count}"
     )
 
 
