@@ -736,6 +736,44 @@ def api_batch_stream() -> Response:
             logo=parsed["logo"],
         )
         packer = lambda src: iter_batch_vector_with_progress(src, "pdf")
+    elif fmt == "zip_eps":
+        # EPS batch: generate EPS files and pack into a ZIP with progress
+        numbers = compute_range(
+            parsed["start"],
+            count=parsed["count"],
+            end=parsed["end"],
+            padding=parsed["padding"],
+        )
+
+        def _eps_packer(src):
+            """Generate EPS files and yield progress + result tokens."""
+            eps_parts = []
+            data_template = parsed["data_template"]
+            label_template = parsed["label_template"]
+            prefix = parsed["prefix"]
+            for idx, n in enumerate(numbers):
+                qr_data = data_template.replace("{n}", n)
+                qr_label = label_template.replace("{n}", n) if label_template is not None else None
+                eps_bytes = generate_qr_eps(
+                    qr_data,
+                    label=qr_label,
+                    box_size=parsed["box_size"],
+                    border=parsed["border"],
+                    template_id=parsed["template_id"],
+                    logo=parsed["logo"],
+                )
+                fname = f"{prefix}{n}.eps"
+                eps_parts.append((fname, eps_bytes))
+                yield ("progress", idx, fname)
+            # Pack into ZIP
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for fname, data in eps_parts:
+                    zf.writestr(fname, data)
+            yield ("result", buf.getvalue())
+
+        items = None
+        packer = _eps_packer
     else:
         items = generate_sequence(
             start=parsed["start"],
@@ -777,7 +815,7 @@ def api_batch_stream() -> Response:
         # than buffering all N images while we wait to start packing.
         try:
             payload: bytes | None = None
-            for token in packer(items):
+            for token in packer(items) if items is not None else packer(None):
                 kind = token[0]
                 if kind == "progress":
                     _, index, name = token
