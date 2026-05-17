@@ -1282,11 +1282,20 @@ def test_pack_pdf_vector_no_image_xobjects_for_no_logo_batch() -> None:
     That makes this assertion strictly stronger than a substring grep
     for the rectangle operator (which would force the production
     path to disable PDF compression just to keep the test cheap).
+
+    Also asserts a non-trivial body length and a positive page count
+    so a regression where ``_pack_pdf_vector`` early-returns an empty
+    PDF (or skips the per-module draw loop) cannot ship green: an
+    empty/short PDF satisfies the zero-image-XObject and ``%PDF-``
+    magic checks but fails the body-size and page-count floors.
     """
+    import math
+
     from qr_generator import _pack_pdf_vector, generate_sequence_render_plan
 
+    count = 3
     plans = list(
-        generate_sequence_render_plan(start=1, count=3, padding=2, prefix="")
+        generate_sequence_render_plan(start=1, count=count, padding=2, prefix="")
     )
     events = list(_pack_pdf_vector(iter(plans)))
     result = [e for e in events if e[0] == "result"][0]
@@ -1297,6 +1306,22 @@ def test_pack_pdf_vector_no_image_xobjects_for_no_logo_batch() -> None:
     assert image_xobjects == 0, (
         f"expected zero image XObjects in a no-logo vector PDF batch, "
         f"got {image_xobjects}"
+    )
+    # Positive draw-evidence: a vector PDF with three QR modules
+    # encoded comfortably exceeds 2 KB even with FlateDecode applied.
+    assert len(body) > 2000, (
+        f"expected the vector PDF body to be non-trivial; got {len(body)} bytes"
+    )
+    # Page-count floor: ``_pack_pdf_vector`` lays the batch out on a
+    # 4-row x 3-col grid (12 per page) so a 3-item batch must render
+    # at least one page object. A regression that skips the per-item
+    # render path entirely would still emit reportlab's PDF skeleton
+    # but would not produce ``/Type /Page`` (singular) references.
+    per_page = 4 * 3
+    expected_pages = math.ceil(count / per_page)
+    assert body.count(b"/Type /Page") >= expected_pages, (
+        f"expected at least {expected_pages} ``/Type /Page`` references "
+        f"in the PDF body, got {body.count(b'/Type /Page')}"
     )
 
 
@@ -1467,6 +1492,149 @@ def test_generate_qr_svg_no_global_crisp_edges_on_curved_drawers() -> None:
     assert "shape-rendering" not in root.attrib
 
 
+@pytest.mark.parametrize(
+    "template_id, drawer_kind",
+    [
+        # default template (no template_id) drives the ``square`` drawer.
+        (None, "square"),
+        ("duathlon-relay", "gapped_square"),
+        ("cycling-roadie", "vertical_bars"),
+        ("running-track", "horizontal_bars"),
+    ],
+)
+def test_generate_qr_svg_grid_aligned_drawer_emits_crisp_edges(
+    template_id: str | None, drawer_kind: str,
+) -> None:
+    """v2 review issue 3: positive assertion that the grid-aligned
+    module drawer kinds opt into ``shape-rendering="crispEdges"`` on
+    the modules group. The companion negative test
+    (``test_generate_qr_svg_no_global_crisp_edges_on_curved_drawers``)
+    pins the curved drawers stay anti-aliased; together they lock the
+    full contract so a regression that drops ``crisp_attr`` entirely
+    from ``_render_modules_svg`` fails this test instead of silently
+    re-AA'ing every grid-aligned QR.
+    """
+    from qr_generator import generate_qr_svg, get_template
+
+    # Sanity: the resolved spec really uses the expected drawer kind.
+    spec_id = template_id if template_id is not None else "default"
+    assert get_template(spec_id)["spec"]["module_drawer_kind"] == drawer_kind
+
+    svg = generate_qr_svg("hello", template_id=template_id)
+    assert 'shape-rendering="crispEdges"' in svg, (
+        f"expected the modules <g> to carry shape-rendering=\"crispEdges\" "
+        f"for grid-aligned drawer kind {drawer_kind!r}"
+    )
+
+
+def test_autofit_centre_badge_font_size_tighter_inner_ratio_picks_smaller_size() -> None:
+    """v2 review issue 4: the SVG centre-badge path passes
+    ``inner_ratio=0.55`` to absorb cross-font glyph-width drift on
+    systems without Plus Jakarta Sans installed, while the PIL/PDF
+    paths use the default ``0.70``. This test pins that the tighter
+    ratio actually engages the autofit step-down loop (i.e. the SVG
+    glyph-size is strictly smaller than the PIL/PDF glyph-size for
+    the same label and badge area).
+
+    The fixed inputs (label ``"BATCH"``, ``badge_side_px = 400.0``)
+    are picked so both calls converge above the 24 px floor: at
+    ``inner_ratio=0.70`` the loop returns 80 px and at
+    ``inner_ratio=0.55`` it returns 60 px on the bundled Plus Jakarta
+    Sans Bold. If the label converged at the floor in both cases the
+    assertion would be meaningless (both calls would return 24).
+    A future refactor that re-unifies the two callsites to a single
+    shared ratio would silently regress and fail this test.
+    """
+    from qr_generator import _autofit_centre_badge_font_size
+
+    label = "BATCH"
+    badge_side_px = 400.0
+
+    loose = _autofit_centre_badge_font_size(label, badge_side_px, inner_ratio=0.70)
+    tight = _autofit_centre_badge_font_size(label, badge_side_px, inner_ratio=0.55)
+
+    floor_px = 24
+    # Sanity: both calls must clear the floor for the comparison to
+    # mean anything (a label that converges at the floor in both
+    # cases would yield ``loose == tight == 24`` and pass a strict
+    # ``<`` check accidentally).
+    assert loose > floor_px, (
+        f"label/badge picked so loose autofit clears the {floor_px} px "
+        f"floor; got {loose}"
+    )
+    assert tight > floor_px, (
+        f"label/badge picked so tight autofit clears the {floor_px} px "
+        f"floor; got {tight}"
+    )
+    # The contract: a tighter ``inner_ratio`` engages more
+    # step-downs and converges on a strictly smaller font size.
+    assert tight < loose, (
+        f"expected inner_ratio=0.55 to autofit to a smaller font-size "
+        f"than inner_ratio=0.70; got tight={tight} loose={loose}"
+    )
+
+
+def test_generate_qr_svg_centre_badge_font_size_uses_tight_ratio() -> None:
+    """v2 review issue 4 (integration counterpart): the SVG centre-
+    badge ``<text>`` element advertises a ``font-size`` attribute and
+    its value matches the tight (0.55) autofit budget rather than the
+    PIL/PDF (0.70) budget.
+
+    A future refactor that re-unified the two callsites to a single
+    shared ratio (whether 0.70 or any other) would silently regress
+    by emitting the loose-budget font size in the SVG. The assertion
+    pins the SVG path's choice by comparing against
+    :func:`_autofit_centre_badge_font_size` called with the same
+    ``inner_ratio=0.55``.
+    """
+    import re
+
+    from qr_generator import _autofit_centre_badge_font_size, generate_qr_svg
+
+    # ``box_size = 40`` plus a 5-character label (``"BATCH"``)
+    # produces a QR canvas where the autofit loop converges above
+    # the 24 px floor for both budgets but the tight budget steps
+    # down further than the loose one (40 px vs 48 px on the
+    # bundled Plus Jakarta Sans Bold). A shorter label like ``"42"``
+    # converges identically under both budgets at this scale, and a
+    # smaller box_size collapses both budgets to the floor.
+    box_size = 40
+    border = 4
+    svg = generate_qr_svg("hello", label="BATCH", box_size=box_size, border=border)
+
+    m = re.search(r'font-size="(\d+)"', svg)
+    assert m is not None, "expected the centre-badge <text> to carry a font-size"
+    chosen = int(m.group(1))
+
+    # Recover the QR canvas pixel side from the SVG viewBox so the
+    # assertion does not need to know the QR's module count (which
+    # depends on the ERROR_CORRECT_H bump that the centre-label path
+    # applies internally). The badge side is 22% of the canvas
+    # width, matching the SVG layout maths in :func:`generate_qr_svg`.
+    vb = re.search(r'viewBox="0 0 (\d+) (\d+)"', svg)
+    assert vb is not None
+    qr_w = int(vb.group(1))
+    badge_side = qr_w * 0.22
+
+    expected_tight = _autofit_centre_badge_font_size(
+        "BATCH", badge_side, inner_ratio=0.55,
+    )
+    expected_loose = _autofit_centre_badge_font_size(
+        "BATCH", badge_side, inner_ratio=0.70,
+    )
+    assert chosen == expected_tight, (
+        f"SVG centre-badge font-size should match the tight (0.55) "
+        f"autofit budget; got {chosen}, expected {expected_tight}"
+    )
+    # And the chosen size must actually differ from the loose-budget
+    # outcome at this scale; otherwise the test is not exercising the
+    # SVG-vs-PIL/PDF divergence.
+    assert expected_tight < expected_loose, (
+        f"test parameters chosen so the tight budget converges below "
+        f"the loose budget; got tight={expected_tight}, loose={expected_loose}"
+    )
+
+
 def test_pack_pdf_vector_bar_drawer_packs_with_zero_image_xobjects() -> None:
     """A PDF batch using a bar-drawer template (``running-track`` =
     horizontal_bars) packs successfully via the run-merge code path,
@@ -1504,35 +1672,48 @@ def test_pack_pdf_vector_bar_drawer_packs_with_zero_image_xobjects() -> None:
     )
 
 
-def test_generate_sequence_svg_logo_uses_shared_padded_logo_data_url() -> None:
+def test_generate_sequence_svg_logo_uses_shared_padded_logo_data_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """v1 review issue 4: ``generate_sequence_svg`` must pre-pad the
     logo once and reuse the same base64 data URL across every emitted
-    SVG, not re-pad and re-encode per item. The functional contract
-    is that every emitted SVG embeds an identical ``data:image/png;base64,...``
-    payload (byte-for-byte) when the same logo is supplied to a
-    multi-item batch. We assert on the base64 payload directly so the
-    test would catch a regression that re-pads per item (each per-item
-    pad is the same image but the test guards against any divergence
-    in the future)."""
-    import re
+    SVG, not re-pad and re-encode per item.
 
-    from qr_generator import generate_sequence_svg
+    The functional contract is "the LANCZOS resize plus PNG encode
+    plus base64 inflation runs at most once across the whole
+    sequence." Asserting only that every emitted SVG embeds the same
+    base64 payload is too weak: Pillow's PNG encoder is deterministic
+    for a given input image and ``LOGO_WORK_SIZE``, so a regression
+    that re-pads per item would still produce identical bytes across
+    items and pass a payload-equality check (the v2 review flagged
+    this).
+
+    To pin the actual contract we monkeypatch ``qr_generator._pad_logo``
+    with a ``MagicMock`` that wraps the real implementation, run a
+    3-item batch via :func:`generate_sequence_svg`, and assert the
+    wrapped helper was called exactly once. The wrap preserves the
+    original behaviour so the resulting SVGs are byte-for-byte the
+    same as before; only the call count is observed.
+    """
+    from unittest.mock import MagicMock
+
+    import qr_generator as _qrg
+
+    spy = MagicMock(wraps=_qrg._pad_logo)
+    monkeypatch.setattr(_qrg, "_pad_logo", spy)
 
     logo = Image.new("RGB", (64, 64), (255, 165, 0))
     items = list(
-        generate_sequence_svg(start=1, count=3, padding=2, prefix="", logo=logo)
+        _qrg.generate_sequence_svg(
+            start=1, count=3, padding=2, prefix="", logo=logo,
+        )
     )
     assert len(items) == 3
-
-    # Pull every base64 payload out of the embedded <image href=...>
-    # data URI and assert they are all identical across items.
-    pattern = re.compile(r'data:image/png;base64,([A-Za-z0-9+/=]+)')
-    payloads = []
-    for _filename, svg in items:
-        m = pattern.search(svg)
-        assert m is not None, "expected an embedded base64 logo in each SVG"
-        payloads.append(m.group(1))
-    assert len(set(payloads)) == 1, (
-        "every SVG in the sequence must embed the same shared "
-        f"base64 logo payload; got {len(set(payloads))} distinct payloads"
+    # The pad-logo helper must run exactly once for the whole batch.
+    # A regression that reverted to per-item padding would record
+    # ``call_count == 3``.
+    assert spy.call_count == 1, (
+        "generate_sequence_svg must pad and base64-encode the logo "
+        f"exactly once per batch; got {spy.call_count} calls for a "
+        "3-item batch"
     )

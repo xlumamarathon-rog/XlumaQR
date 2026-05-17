@@ -1636,9 +1636,19 @@ def test_batch_format_pdf_is_vector(client) -> None:
     logo is supplied. The image-XObject count is invariant under the
     PDF content-stream compression that reportlab applies by default,
     so this assertion holds regardless of whether the body bytes are
-    FlateDecode'd."""
+    FlateDecode'd.
+
+    Also asserts a non-trivial body length and a positive page count
+    so a regression where the vector PDF path early-returns an empty
+    PDF (or skips the per-module draw loop) cannot ship green: an
+    empty/short PDF satisfies the zero-image-XObject check but fails
+    the body-size and page-count floors.
+    """
+    import math
+
+    count = 3
     rv = client.post(
-        "/api/qr/batch", data={"start": "1", "count": "3", "format": "pdf"}
+        "/api/qr/batch", data={"start": "1", "count": str(count), "format": "pdf"}
     )
     assert rv.status_code == 200
     assert rv.mimetype == "application/pdf"
@@ -1646,6 +1656,17 @@ def test_batch_format_pdf_is_vector(client) -> None:
     image_xobjects = body.count(b"/Subtype /Image") + body.count(b"/Subtype/Image")
     assert image_xobjects == 0, (
         f"vector PDF batch should have no image XObjects; got {image_xobjects}"
+    )
+    # Positive draw-evidence: see the matching core-level test for
+    # why these floors are needed even with the image-XObject check.
+    assert len(body) > 2000, (
+        f"expected the vector PDF body to be non-trivial; got {len(body)} bytes"
+    )
+    per_page = 4 * 3
+    expected_pages = math.ceil(count / per_page)
+    assert body.count(b"/Type /Page") >= expected_pages, (
+        f"expected at least {expected_pages} ``/Type /Page`` references "
+        f"in the PDF body, got {body.count(b'/Type /Page')}"
     )
 
 

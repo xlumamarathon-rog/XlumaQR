@@ -105,12 +105,13 @@ Form fields:
   > outputs intentionally drop the per-template `back_color` so the
   > QR modules sit on a transparent canvas (matching the user
   > request: "no solid background after downloading"). The legacy
-  > ZIP-of-PNGs path keeps the template's white `back_color` so the
-  > PNG bytes stay byte-identical for back-compat (the legacy
-  > byte-equality regression test still guards `generate_qr` for the
-  > no-template / no-logo case). If you save the same QR as both a
-  > PNG and an SVG you will see different effective backgrounds:
-  > opaque white in the PNG, transparent in the SVG and PDF.
+  > ZIP-of-PNGs path keeps the template's white `back_color` (the
+  > PIL render path and `_pack_zip` predate the vector-downloads
+  > work and were deliberately left untouched; only the new SVG
+  > and vector-PDF paths drop the white background). If you save
+  > the same QR as both a PNG and an SVG you will see different
+  > effective backgrounds: opaque white in the PNG, transparent in
+  > the SVG and PDF.
 
   > **Gradient parity caveat:** templates with a gradient
   > `color_mask_kind` (e.g. `marathon-fire`'s radial fade or
