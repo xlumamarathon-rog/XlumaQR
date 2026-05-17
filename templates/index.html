@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>XlumaQR - QR code generator</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>◼</text></svg>">
     <link
       rel="stylesheet"
       href="{{ url_for('static', filename='style.css') }}"
@@ -14,7 +15,7 @@
       <header>
         <h1>XlumaQR</h1>
         <p class="tagline">
-          Generate a single QR code or a sequential batch (ZIP or PDF).
+          Vector QR codes for marathon bibs &amp; race events. Print-ready, transparent, scalable.
         </p>
       </header>
 
@@ -53,7 +54,7 @@
               id="single-data"
               name="data"
               required
-              placeholder="https://example.com/123"
+              placeholder="https://example.com/runner/1234"
             />
           </div>
           <div class="row">
@@ -62,7 +63,7 @@
               type="text"
               id="single-label"
               name="label"
-              placeholder="42"
+              placeholder="e.g. 1234"
             />
           </div>
           <div class="row two-col">
@@ -140,13 +141,13 @@
         </div>
         <div id="single-downloads" class="download-buttons" hidden>
           <button type="button" id="dl-eps" class="secondary" title="Vector EPS — opens in Photoshop/Illustrator, no pixelation at any print size">
-            ⬇ Download EPS (Print Vector)
+            ⬇ EPS (Vector)
           </button>
           <button type="button" id="dl-print-png" class="secondary" title="High-resolution 300 DPI PNG — works in Photoshop, crisp at marathon bib size">
-            ⬇ Download Print PNG (300 DPI)
+            ⬇ PNG (300 DPI)
           </button>
-          <button type="button" id="dl-svg" class="secondary" title="Vector SVG — sharp at any zoom, but may not open in Photoshop">
-            ⬇ Download SVG
+          <button type="button" id="dl-svg" class="secondary" title="Vector SVG — sharp at any zoom">
+            ⬇ SVG
           </button>
         </div>
       </section>
@@ -161,17 +162,17 @@
         <form id="batch-form" class="qr-form">
           <div class="row two-col">
             <div>
-              <label for="batch-start">Start (required)</label>
+              <label for="batch-start">Start number</label>
               <input
                 type="number"
                 id="batch-start"
                 name="start"
-                placeholder="e.g. 101"
+                placeholder="e.g. 1001"
                 required
               />
             </div>
             <div>
-              <label for="batch-padding">Padding</label>
+              <label for="batch-padding">Zero padding</label>
               <input
                 type="number"
                 id="batch-padding"
@@ -215,7 +216,7 @@
               type="number"
               id="batch-end"
               name="end"
-              placeholder="e.g. 200"
+              placeholder="e.g. 1100"
             />
           </div>
 
@@ -231,7 +232,7 @@
                 type="text"
                 id="batch-prefix"
                 name="prefix"
-                placeholder="(optional, e.g. qr_)"
+                placeholder="e.g. bib_"
               />
             </div>
             <div class="row two-col">
@@ -324,39 +325,37 @@
           <fieldset class="row format-toggle">
             <legend>Download format</legend>
             <label
-              title="One QR per page, vector, transparent background. Perfect for placing on bib designs in Photoshop/Illustrator/InDesign."
+              title="One QR per page, vector, transparent background. Perfect for placing on bib designs."
             >
               <input type="radio" name="format" value="pdf_single" checked />
               PDF (1 QR per page, transparent, vector)
             </label>
             <label
-              title="Each QR is a vector EPS file. Opens in Photoshop, Illustrator, InDesign. Perfect for marathon bib printing — no pixelation at any size."
+              title="Each QR is a vector EPS file. Opens in Photoshop, Illustrator, InDesign."
             >
               <input type="radio" name="format" value="zip_eps" />
-              ZIP (EPS vectors — Photoshop/Illustrator)
+              ZIP (EPS vectors)
             </label>
             <label
-              title="Each QR is a vector SVG with a transparent background. Stays sharp at any zoom level. Gradient templates render the full gradient via SVG defs."
+              title="Each QR is a vector SVG with a transparent background."
             >
               <input type="radio" name="format" value="zip_svg" />
-              ZIP (SVG vectors, no pixelation)
+              ZIP (SVG vectors)
             </label>
             <label
-              title="High-res transparent PNG per QR. Works in Photoshop."
+              title="High-res transparent PNG per QR."
             >
               <input type="radio" name="format" value="zip" />
               ZIP (PNG, transparent, high-res)
             </label>
             <label
-              title="Vector PDF grid layout (multiple QRs per page). Good for printing sheets."
+              title="Vector PDF grid layout (multiple QRs per page)."
             >
               <input type="radio" name="format" value="pdf" />
-              PDF (grid layout, multiple per page)
+              PDF (grid layout)
             </label>
-            <p class="format-toggle-note hint">
-              PDF (1 per page) is recommended for marathon bibs —
-              vector, transparent, one QR per page ready to place
-              on your bib design.
+            <p class="format-toggle-note">
+              PDF (1 per page) recommended — vector, transparent, ready to place on bib designs.
             </p>
           </fieldset>
 
@@ -381,7 +380,7 @@
           </div>
         </form>
         <div id="batch-preview" class="preview">
-          <p class="preview-empty">A sample QR using the first range value will appear here.</p>
+          <p class="preview-empty">A sample QR will appear here once you configure the range.</p>
         </div>
       </section>
     </main>
