@@ -2238,15 +2238,14 @@ def _pack_pdf_vector(
         # scaling: the actual scale is determined by cell-fit below.
         unit = 1.0
         qr_side = qr_modules_side * unit
-        # Band height (band-below layout) follows the PIL render's
-        # proportions: ~12% of the QR pixel height plus 2 * pad_y
-        # where pad_y >= unit. Always allocate band space when a label
-        # is present so the label never overlaps the QR pattern.
+        # Band height for the label below the QR. Keep it proportional
+        # to the QR size — roughly 18% of the QR height so the label
+        # is readable but doesn't dominate the layout.
         band_h = 0.0
         font_size_px = 0.0
         if label is not None:
-            font_size_px = max(14, int(qr_side * 12 // 100))
-            pad_y = max(unit, font_size_px / 2.0)
+            font_size_px = max(3.0, qr_side * 0.18)
+            pad_y = max(unit, font_size_px * 0.4)
             band_h = font_size_px + 2 * pad_y
         total_w = qr_side
         total_h = qr_side + band_h
@@ -2364,12 +2363,7 @@ def _pack_pdf_vector(
         # appeal, but the downloaded PDF prioritises scannability.
         if centre_label and label is not None:
             # Draw a white band below the QR and place the label there
-            font_size_px = max(14, int(qr_side * 12 // 100))
-            pad_y = max(unit, font_size_px / 2.0)
-            band_h_local = (font_size_px + 2 * pad_y) * scale
-            band_y = qr_y0 - band_h_local
-            c.setFillColorRGB(1, 1, 1)
-            c.rect(x0, band_y, qr_pdf_w, band_h_local, fill=1, stroke=0)
+            band_y = qr_y0 - band_pdf_h
             if is_default:
                 glyph_color = (0, 0, 0)
             else:
@@ -2385,14 +2379,13 @@ def _pack_pdf_vector(
             except KeyError:  # pragma: no cover
                 c.setFont("Helvetica-Bold", font_size_pt)
             text_x = x0 + qr_pdf_w / 2.0
-            text_y = band_y + band_h_local / 2.0 - font_size_pt * 0.35
+            text_y = band_y + band_pdf_h / 2.0 - font_size_pt * 0.35
             c.drawCentredString(text_x, text_y, label)
 
-        # Band-below layout: white band + centred label glyph.
+        # Band-below layout: centred label glyph below QR (no white
+        # background so the PDF stays transparent for overlay on bibs).
         if label is not None and logo is not None:
             band_y = qr_y0 - band_pdf_h
-            c.setFillColorRGB(1, 1, 1)
-            c.rect(x0, band_y, qr_pdf_w, band_pdf_h, fill=1, stroke=0)
             if is_default:
                 glyph_color = (0, 0, 0)
             else:
@@ -2504,8 +2497,9 @@ def generate_qr_eps(
     qr_side = (modules_count + 2 * border) * box_size
     label_band_h = 0
     if label is not None:
-        font_size = max(14, qr_side * 12 // 100)
-        label_band_h = font_size + max(box_size, font_size // 2) * 2
+        font_size = max(14, int(qr_side * 0.18))
+        pad_y = max(box_size, int(font_size * 0.4))
+        label_band_h = font_size + 2 * pad_y
 
     canvas_w = qr_side
     canvas_h = qr_side + label_band_h
@@ -2521,9 +2515,7 @@ def generate_qr_eps(
     lines.append("%%EndComments")
     lines.append("")
 
-    # White background
-    lines.append("1 1 1 setrgbcolor")
-    lines.append(f"0 0 {canvas_w} {canvas_h} rectfill")
+    # No solid background — transparent for overlay on bib designs
     lines.append("")
 
     # Set foreground colour
@@ -2587,16 +2579,13 @@ def generate_qr_eps(
     # present), the EPS print output always places the label below the QR
     # so it never obscures any modules and the code remains scannable.
     if label is not None:
-        font_size = max(14, qr_side * 12 // 100)
+        font_size = max(14, int(qr_side * 0.18))
         # Label in band below QR (PostScript origin is bottom-left,
         # so the band occupies y=0..label_band_h)
         text_y = label_band_h // 2 - font_size // 3
 
-        # Draw white background for the label band
+        # No white background — keep transparent for bib overlay
         lines.append("")
-        lines.append("1 1 1 setrgbcolor")
-        lines.append(f"0 0 {canvas_w} {label_band_h} rectfill")
-
         lines.append(f"{r/255:.4f} {g/255:.4f} {b/255:.4f} setrgbcolor")
         lines.append(f"/Helvetica-Bold findfont {font_size} scalefont setfont")
         # Centre the text horizontally
@@ -2621,6 +2610,7 @@ def generate_qr_print_png(
     template_id: str | None = None,
     logo: Image.Image | None = None,
     dpi: int = 300,
+    transparent: bool = True,
 ) -> bytes:
     """Render a high-resolution PNG suitable for print (default 300 DPI).
 
@@ -2630,6 +2620,11 @@ def generate_qr_print_png(
 
     At 300 DPI with box_size=40, a typical QR prints at roughly
     5.5 inches / 14 cm per side — perfect for a marathon bib.
+
+    When ``transparent=True`` (default), the white background is
+    converted to transparent so the QR can be overlaid on bib designs
+    in Photoshop/Illustrator without needing to manually remove the
+    background.
 
     Returns raw PNG bytes with embedded DPI metadata.
     """
@@ -2641,6 +2636,20 @@ def generate_qr_print_png(
         template_id=template_id,
         logo=logo,
     )
+
+    if transparent:
+        # Convert white background to transparent using PIL's built-in
+        # operations for speed (avoids slow per-pixel Python loops).
+        image = image.convert("RGBA")
+        datas = image.getdata()
+        new_data = []
+        for item in datas:
+            # Make white and near-white pixels fully transparent
+            if item[0] > 240 and item[1] > 240 and item[2] > 240:
+                new_data.append((item[0], item[1], item[2], 0))
+            else:
+                new_data.append(item)
+        image.putdata(new_data)
 
     buf = io.BytesIO()
     # Embed DPI metadata so Photoshop reads the physical size correctly
