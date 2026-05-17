@@ -73,6 +73,8 @@ from reportlab.pdfgen import canvas as pdf_canvas
 __all__ = [
     "generate_qr",
     "generate_qr_svg",
+    "generate_qr_eps",
+    "generate_qr_print_png",
     "compute_range",
     "generate_sequence",
     "generate_sequence_svg",
@@ -2442,3 +2444,206 @@ def iter_batch_vector_with_progress(
         yield from _pack_pdf_vector(items)
     else:
         raise ValueError("fmt must be 'zip_svg' or 'pdf'")
+
+
+# --- EPS (Encapsulated PostScript) export --------------------------------
+#
+# EPS is the gold standard for print workflows. Photoshop, Illustrator,
+# InDesign, and CorelDRAW all open EPS natively. The QR modules are
+# drawn as PostScript path rectangles (or circles for circle drawers),
+# so the output is fully vector and will not pixelate at any print size.
+
+
+def generate_qr_eps(
+    data: str,
+    label: str | None = None,
+    box_size: int = 10,
+    border: int = 4,
+    template_id: str | None = None,
+    logo: Image.Image | None = None,
+) -> bytes:
+    """Render ``data`` as a QR code and return EPS (vector) bytes.
+
+    The output is a fully vector Encapsulated PostScript file that opens
+    in Photoshop, Illustrator, InDesign, and CorelDRAW without
+    pixelation at any scale. Ideal for marathon bib printing.
+
+    Uses reportlab to generate a single-page PDF, then wraps it as EPS
+    via the reportlab canvas EPS output mode. Actually, we build the EPS
+    directly using PostScript primitives for maximum compatibility.
+
+    Parameters mirror :func:`generate_qr_svg`.
+    """
+    # Build the QR matrix
+    centre_label = label is not None and logo is None
+    use_high_ec = logo is not None or centre_label
+    ec_level = ERROR_CORRECT_H if use_high_ec else ERROR_CORRECT_M
+
+    qr = qrcode.QRCode(
+        error_correction=ec_level,
+        box_size=box_size,
+        border=border,
+    )
+    qr.add_data(data)
+    qr.make(fit=True)
+    modules = qr.modules
+    if modules is None:
+        raise RuntimeError("qrcode.QRCode.make did not populate modules")
+    modules_count = qr.modules_count
+
+    # Resolve template colours
+    spec_id = template_id if template_id is not None else "default"
+    template = get_template(spec_id)
+    spec = template["spec"]
+    is_default = _is_default_template(template_id)
+
+    if is_default:
+        fg_color = (0, 0, 0)
+    else:
+        fg_color = _label_color_from_spec(spec)
+
+    # Canvas dimensions in points (1 point = 1/72 inch)
+    # Use box_size as points so the QR is physically large enough for print
+    qr_side = (modules_count + 2 * border) * box_size
+    label_band_h = 0
+    if label is not None:
+        font_size = max(14, qr_side * 12 // 100)
+        label_band_h = font_size + max(box_size, font_size // 2) * 2
+
+    canvas_w = qr_side
+    canvas_h = qr_side + label_band_h
+
+    # Build EPS
+    lines: list[str] = []
+    lines.append("%!PS-Adobe-3.0 EPSF-3.0")
+    lines.append(f"%%BoundingBox: 0 0 {canvas_w} {canvas_h}")
+    lines.append("%%HiResBoundingBox: 0.0 0.0 {:.1f} {:.1f}".format(
+        float(canvas_w), float(canvas_h)
+    ))
+    lines.append("%%Creator: XlumaQR")
+    lines.append("%%Title: QR Code")
+    lines.append("%%Pages: 1")
+    lines.append("%%EndComments")
+    lines.append("")
+
+    # White background
+    lines.append("1 1 1 setrgbcolor")
+    lines.append(f"0 0 {canvas_w} {canvas_h} rectfill")
+    lines.append("")
+
+    # Set foreground colour
+    r, g, b = fg_color
+    lines.append(f"{r/255:.4f} {g/255:.4f} {b/255:.4f} setrgbcolor")
+    lines.append("")
+
+    # Draw QR modules as filled rectangles
+    # PostScript origin is bottom-left, so we flip Y
+    drawer_kind = spec.get("module_drawer_kind", "square")
+
+    for row_idx, row in enumerate(modules):
+        for col_idx, is_on in enumerate(row):
+            if not is_on:
+                continue
+            x = (col_idx + border) * box_size
+            # Flip Y: PostScript origin is bottom-left
+            y = canvas_h - label_band_h - (row_idx + border + 1) * box_size
+
+            if drawer_kind == "circle":
+                cx = x + box_size / 2
+                cy = y + box_size / 2
+                radius = box_size / 2
+                lines.append(
+                    f"{cx:.1f} {cy:.1f} {radius:.1f} 0 360 arc fill"
+                )
+            else:
+                lines.append(f"{x} {y} {box_size} {box_size} rectfill")
+
+    # Draw logo if provided (as embedded raster in EPS)
+    if logo is not None:
+        padded = _pad_logo(logo, box_size)
+        logo_size = int(qr_side * 0.22)
+        padded_resized = padded.copy()
+        padded_resized.thumbnail((logo_size, logo_size), Image.LANCZOS)
+        lw, lh = padded_resized.size
+        lx = (canvas_w - lw) // 2
+        ly = canvas_h - label_band_h - (qr_side + lh) // 2
+
+        # Encode as hex string for EPS image operator
+        rgb_img = padded_resized.convert("RGB")
+        img_data = rgb_img.tobytes()
+        hex_data = img_data.hex()
+
+        lines.append("")
+        lines.append("gsave")
+        lines.append(f"{lx} {ly} translate")
+        lines.append(f"{lw} {lh} scale")
+        lines.append(f"/picstr {lw * 3} string def")
+        lines.append(
+            f"{lw} {lh} 8 [{lw} 0 0 -{lh} 0 {lh}]"
+        )
+        lines.append("{currentfile picstr readhexstring pop} false 3 colorimage")
+        # Write hex data in 72-char lines
+        for i in range(0, len(hex_data), 72):
+            lines.append(hex_data[i:i+72])
+        lines.append("grestore")
+
+    # Draw label text
+    if label is not None:
+        font_size = max(14, qr_side * 12 // 100)
+        if logo is not None:
+            # Label in band below QR
+            text_y = label_band_h // 2 - font_size // 3
+        else:
+            # Centre badge label
+            text_y = canvas_h // 2 - font_size // 3
+
+        lines.append("")
+        lines.append(f"{r/255:.4f} {g/255:.4f} {b/255:.4f} setrgbcolor")
+        lines.append(f"/Helvetica-Bold findfont {font_size} scalefont setfont")
+        # Centre the text
+        escaped_label = label.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        lines.append(f"({escaped_label}) dup stringwidth pop")
+        lines.append(f"{canvas_w} exch sub 2 div {text_y} moveto")
+        lines.append(f"({escaped_label}) show")
+
+    lines.append("")
+    lines.append("showpage")
+    lines.append("%%EOF")
+    lines.append("")
+
+    return "\n".join(lines).encode("latin-1")
+
+
+def generate_qr_print_png(
+    data: str,
+    label: str | None = None,
+    box_size: int = 40,
+    border: int = 4,
+    template_id: str | None = None,
+    logo: Image.Image | None = None,
+    dpi: int = 300,
+) -> bytes:
+    """Render a high-resolution PNG suitable for print (default 300 DPI).
+
+    Uses a large ``box_size`` (default 40, producing ~1600px wide QR for
+    a typical 33-module code) and embeds DPI metadata so Photoshop and
+    print software interpret the physical size correctly.
+
+    At 300 DPI with box_size=40, a typical QR prints at roughly
+    5.5 inches / 14 cm per side — perfect for a marathon bib.
+
+    Returns raw PNG bytes with embedded DPI metadata.
+    """
+    image = generate_qr(
+        data,
+        label=label,
+        box_size=box_size,
+        border=border,
+        template_id=template_id,
+        logo=logo,
+    )
+
+    buf = io.BytesIO()
+    # Embed DPI metadata so Photoshop reads the physical size correctly
+    image.save(buf, format="PNG", dpi=(dpi, dpi))
+    return buf.getvalue()

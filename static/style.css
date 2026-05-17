@@ -385,3 +385,32 @@ button.primary:disabled {
   color: var(--fg);
   border-color: var(--primary);
 }
+
+/* Download buttons for single QR */
+.download-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.download-buttons[hidden] {
+  display: none;
+}
+
+button.secondary {
+  background: #ffffff;
+  color: var(--primary);
+  border: 1px solid var(--primary);
+  border-radius: 6px;
+  padding: 8px 14px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+button.secondary:hover {
+  background: var(--primary);
+  color: var(--primary-fg);
+}

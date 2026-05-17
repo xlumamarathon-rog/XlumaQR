@@ -138,6 +138,17 @@
         <div id="single-preview" class="preview">
           <p class="preview-empty">Your QR code will appear here.</p>
         </div>
+        <div id="single-downloads" class="download-buttons" hidden>
+          <button type="button" id="dl-eps" class="secondary" title="Vector EPS — opens in Photoshop/Illustrator, no pixelation at any print size">
+            ⬇ Download EPS (Print Vector)
+          </button>
+          <button type="button" id="dl-print-png" class="secondary" title="High-resolution 300 DPI PNG — works in Photoshop, crisp at marathon bib size">
+            ⬇ Download Print PNG (300 DPI)
+          </button>
+          <button type="button" id="dl-svg" class="secondary" title="Vector SVG — sharp at any zoom, but may not open in Photoshop">
+            ⬇ Download SVG
+          </button>
+        </div>
       </section>
 
       <section
@@ -308,9 +319,15 @@
           <fieldset class="row format-toggle">
             <legend>Download format</legend>
             <label
+              title="Each QR is a vector EPS file. Opens in Photoshop, Illustrator, InDesign. Perfect for marathon bib printing — no pixelation at any size."
+            >
+              <input type="radio" name="format" value="zip_eps" checked />
+              ZIP (EPS vectors — Photoshop/Illustrator)
+            </label>
+            <label
               title="Each QR is a vector SVG with a transparent background. Stays sharp at any zoom level. Gradient templates render the full gradient via SVG defs."
             >
-              <input type="radio" name="format" value="zip_svg" checked />
+              <input type="radio" name="format" value="zip_svg" />
               ZIP (SVG vectors, no pixelation)
             </label>
             <label
@@ -326,10 +343,10 @@
               PDF (vector grid layout)
             </label>
             <p class="format-toggle-note hint">
-              SVG and PDF downloads have a transparent background;
-              the legacy PNG ZIP keeps the template's white
-              background. Gradient templates render fully in SVG but
-              flatten to one colour in PDF.
+              EPS is recommended for print (marathon bibs). Opens
+              directly in Photoshop and Illustrator with no
+              pixelation. SVG and PDF are also vector but may not
+              open in Photoshop.
             </p>
           </fieldset>
 

@@ -14,6 +14,7 @@ import io
 import json
 import re
 import warnings
+import zipfile
 from typing import Any, Iterator
 
 from flask import Flask, Response, jsonify, render_template, request, send_file, stream_with_context
@@ -29,6 +30,8 @@ from qr_generator import (
     MAX_PADDING,
     compute_range,
     generate_qr,
+    generate_qr_eps,
+    generate_qr_print_png,
     generate_qr_svg,
     generate_sequence,
     generate_sequence_render_plan,
@@ -327,8 +330,8 @@ def api_single() -> Response:
         label = None
 
     output_format = (request.form.get("output_format") or "png").strip().lower()
-    if output_format not in {"png", "svg"}:
-        return jsonify({"error": "output_format must be 'png' or 'svg'"}), 400
+    if output_format not in {"png", "svg", "eps", "print_png"}:
+        return jsonify({"error": "output_format must be 'png', 'svg', 'eps', or 'print_png'"}), 400
 
     try:
         box_size = _parse_int(
@@ -351,6 +354,45 @@ def api_single() -> Response:
         return jsonify({"error": str(exc)}), 400
 
     assert box_size is not None and border is not None  # defaults guarantee non-None
+
+    if output_format == "eps":
+        try:
+            eps_bytes = generate_qr_eps(
+                data,
+                label=label,
+                box_size=box_size,
+                border=border,
+                template_id=template_id,
+                logo=logo,
+            )
+        except ValueError as exc:
+            return jsonify({"error": f"data could not be encoded: {exc}"}), 400
+        return send_file(
+            io.BytesIO(eps_bytes),
+            mimetype="application/postscript",
+            as_attachment=True,
+            download_name="qr.eps",
+        )
+
+    if output_format == "print_png":
+        try:
+            png_bytes = generate_qr_print_png(
+                data,
+                label=label,
+                box_size=40,
+                border=border,
+                template_id=template_id,
+                logo=logo,
+                dpi=300,
+            )
+        except ValueError as exc:
+            return jsonify({"error": f"data could not be encoded: {exc}"}), 400
+        return send_file(
+            io.BytesIO(png_bytes),
+            mimetype="image/png",
+            as_attachment=True,
+            download_name="qr_300dpi.png",
+        )
 
     if output_format == "svg":
         try:
@@ -465,6 +507,34 @@ def api_batch() -> Response:
             payload = payload2
             mimetype = "application/zip"
             filename = f"qr_batch_{first_n}_{last_n}.zip"
+        elif fmt == "zip_eps":
+            # Generate EPS files for each QR in the batch
+            numbers = compute_range(
+                parsed["start"],
+                count=parsed["count"],
+                end=parsed["end"],
+                padding=parsed["padding"],
+            )
+            eps_buffer = io.BytesIO()
+            with zipfile.ZipFile(eps_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                data_template = parsed["data_template"]
+                label_template = parsed["label_template"]
+                prefix = parsed["prefix"]
+                for n in numbers:
+                    qr_data = data_template.replace("{n}", n)
+                    qr_label = label_template.replace("{n}", n) if label_template is not None else None
+                    eps_bytes = generate_qr_eps(
+                        qr_data,
+                        label=qr_label,
+                        box_size=parsed["box_size"],
+                        border=parsed["border"],
+                        template_id=parsed["template_id"],
+                        logo=parsed["logo"],
+                    )
+                    zf.writestr(f"{prefix}{n}.eps", eps_bytes)
+            payload = eps_buffer.getvalue()
+            mimetype = "application/zip"
+            filename = f"qr_batch_{first_n}_{last_n}_eps.zip"
         else:
             items = generate_sequence(
                 start=parsed["start"],
@@ -564,8 +634,8 @@ def _parse_batch_form() -> tuple[dict[str, Any] | None, str | None]:
         return None, f"label_template must be <= {MAX_DATA_LENGTH} characters"
 
     fmt = (request.form.get("format") or "zip").strip().lower()
-    if fmt not in {"zip", "zip_svg", "pdf"}:
-        return None, "format must be 'zip', 'zip_svg', or 'pdf'"
+    if fmt not in {"zip", "zip_svg", "zip_eps", "pdf"}:
+        return None, "format must be 'zip', 'zip_svg', 'zip_eps', or 'pdf'"
 
     # Validate the range up front so we can return a clean 400 before we
     # start rendering hundreds of QR codes.

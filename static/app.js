@@ -578,6 +578,75 @@
     });
   }
 
+  // ---- Single QR download buttons (EPS, Print PNG, SVG) ---------------
+  var singleDownloads = document.getElementById("single-downloads");
+  var dlEpsBtn = document.getElementById("dl-eps");
+  var dlPrintPngBtn = document.getElementById("dl-print-png");
+  var dlSvgBtn = document.getElementById("dl-svg");
+
+  function downloadSingleAs(outputFormat, filename) {
+    if (!singleForm) return;
+    var formData = new FormData(singleForm);
+    formData.set("output_format", outputFormat);
+    // For print PNG, force high box_size
+    if (outputFormat === "print_png") {
+      formData.set("box_size", "40");
+    }
+    fetch("/api/qr/single", { method: "POST", body: formData })
+      .then(function (response) {
+        if (!response.ok) {
+          return response.json().then(
+            function (body) { throw new Error(body.error || "Request failed"); },
+            function () { throw new Error("Request failed (" + response.status + ")"); }
+          );
+        }
+        return response.blob();
+      })
+      .then(function (blob) {
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+      })
+      .catch(function (err) {
+        singleError.textContent = err.message;
+        singleError.hidden = false;
+      });
+  }
+
+  if (dlEpsBtn) {
+    dlEpsBtn.addEventListener("click", function () {
+      downloadSingleAs("eps", "qr.eps");
+    });
+  }
+  if (dlPrintPngBtn) {
+    dlPrintPngBtn.addEventListener("click", function () {
+      downloadSingleAs("print_png", "qr_300dpi.png");
+    });
+  }
+  if (dlSvgBtn) {
+    dlSvgBtn.addEventListener("click", function () {
+      downloadSingleAs("svg", "qr.svg");
+    });
+  }
+
+  // Show download buttons after a QR is generated
+  if (singleForm && singleDownloads) {
+    var origSubmitHandler = singleForm.onsubmit;
+    // Observe preview changes to show/hide download buttons
+    var observer = new MutationObserver(function () {
+      var hasImg = singlePreview && singlePreview.querySelector("img");
+      singleDownloads.hidden = !hasImg;
+    });
+    if (singlePreview) {
+      observer.observe(singlePreview, { childList: true, subtree: true });
+    }
+  }
+
   // ---- Batch -------------------------------------------------------
   var batchForm = document.getElementById("batch-form");
   var batchHint = document.getElementById("batch-hint");
