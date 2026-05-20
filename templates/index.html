@@ -38,6 +38,15 @@
         >
           Sequential Batch
         </button>
+        <button
+          type="button"
+          class="tab"
+          data-tab="bibbatch"
+          role="tab"
+          aria-selected="false"
+        >
+          Bib Batch
+        </button>
       </nav>
 
       <section
@@ -381,6 +390,141 @@
         </form>
         <div id="batch-preview" class="preview">
           <p class="preview-empty">A sample QR will appear here once you configure the range.</p>
+        </div>
+      </section>
+
+      <section
+        id="panel-bibbatch"
+        class="panel"
+        role="tabpanel"
+        aria-labelledby="bibbatch"
+        hidden
+      >
+        <form id="bibbatch-form" class="qr-form">
+          <div class="row two-col">
+            <div>
+              <label for="bibbatch-prefix">Bib prefix (optional)</label>
+              <input
+                type="text"
+                id="bibbatch-prefix"
+                name="prefix"
+                placeholder="e.g. D-"
+              />
+            </div>
+            <div>
+              <label for="bibbatch-start">Start number (required)</label>
+              <input
+                type="number"
+                id="bibbatch-start"
+                name="start"
+                placeholder="e.g. 1"
+                required
+                min="0"
+              />
+            </div>
+          </div>
+
+          <div class="row two-col">
+            <div>
+              <label for="bibbatch-count">Count (required)</label>
+              <input
+                type="number"
+                id="bibbatch-count"
+                name="count"
+                placeholder="e.g. 100"
+                required
+                min="1"
+              />
+            </div>
+            <div>
+              <label for="bibbatch-padding">Zero padding</label>
+              <input
+                type="number"
+                id="bibbatch-padding"
+                name="padding"
+                placeholder="e.g. 3 → 001"
+                min="0"
+                value="3"
+              />
+            </div>
+          </div>
+
+          <div class="row">
+            <p id="bibbatch-hint" class="hint">
+              Enter a prefix and start number to see the bib range.
+            </p>
+          </div>
+
+          <fieldset class="row design-section" data-form="bibbatch">
+            <legend>Design (optional)</legend>
+            <div class="row">
+              <label for="bibbatch-template-category">Template category</label>
+              <select
+                id="bibbatch-template-category"
+                class="category-select"
+                data-form="bibbatch"
+              ></select>
+            </div>
+            <div
+              id="bibbatch-template-grid"
+              class="template-grid"
+              data-form="bibbatch"
+            ></div>
+            <input
+              type="hidden"
+              id="bibbatch-template-id"
+              name="template_id"
+              value="default"
+            />
+            <div class="row logo-upload-row">
+              <label for="bibbatch-logo">Centre logo (optional, PNG or JPEG)</label>
+              <div class="logo-upload-controls">
+                <input
+                  type="file"
+                  id="bibbatch-logo"
+                  name="logo"
+                  accept="image/png,image/jpeg"
+                  data-form="bibbatch"
+                />
+                <button
+                  type="button"
+                  class="logo-clear-btn"
+                  data-form="bibbatch"
+                >
+                  Clear logo
+                </button>
+              </div>
+            </div>
+          </fieldset>
+
+          <fieldset class="row format-toggle">
+            <legend>Download format</legend>
+            <label title="High-res transparent PNG per QR + Excel mapping.">
+              <input type="radio" name="format" value="zip" checked />
+              ZIP (PNG, transparent, high-res) + Excel mapping
+            </label>
+            <label title="Vector SVG per QR + Excel mapping.">
+              <input type="radio" name="format" value="zip_svg" />
+              ZIP (SVG vectors) + Excel mapping
+            </label>
+          </fieldset>
+
+          <div class="row">
+            <button type="submit" class="primary">Generate &amp; download</button>
+          </div>
+          <div id="bibbatch-error" class="error" hidden></div>
+          <div id="bibbatch-progress" class="progress-section" hidden>
+            <div class="progress-bar-container">
+              <div class="progress-bar-fill"></div>
+            </div>
+            <p class="progress-text">Generating QR codes...</p>
+          </div>
+        </form>
+        <div id="bibbatch-preview" class="preview">
+          <p class="preview-empty">
+            Each QR encodes a unique code (like a chip ID). The ZIP includes an Excel mapping file
+            that links each unique QR code to its bib number.
+          </p>
         </div>
       </section>
     </main>

@@ -6,6 +6,7 @@
   var panels = {
     single: document.getElementById("panel-single"),
     batch: document.getElementById("panel-batch"),
+    bibbatch: document.getElementById("panel-bibbatch"),
   };
 
   tabs.forEach(function (tab) {
@@ -1194,6 +1195,161 @@
           showError(err.message || String(err));
         })
         .finally(finish);
+    });
+  }
+
+  // ---- Bib Batch tab ------------------------------------------------
+  var bibBatchDesign = setupDesignSection("bibbatch", function () {
+    // No live preview for bib batch — just update the template selection
+  });
+
+  // Load templates into the bib batch design section (reuse the already-fetched data)
+  fetch("/api/qr/templates")
+    .then(function (response) {
+      if (!response.ok) throw new Error("templates fetch failed");
+      return response.json();
+    })
+    .then(function (body) {
+      var templates = (body && body.templates) || [];
+      if (bibBatchDesign) bibBatchDesign.load(templates);
+    })
+    .catch(function () {});
+
+  var bibBatchForm = document.getElementById("bibbatch-form");
+  var bibBatchError = document.getElementById("bibbatch-error");
+  var bibBatchProgress = document.getElementById("bibbatch-progress");
+  var bibBatchHint = document.getElementById("bibbatch-hint");
+  var bibBatchPrefix = document.getElementById("bibbatch-prefix");
+  var bibBatchStart = document.getElementById("bibbatch-start");
+  var bibBatchCount = document.getElementById("bibbatch-count");
+  var bibBatchPadding = document.getElementById("bibbatch-padding");
+
+  // Update hint as user types
+  function updateBibBatchHint() {
+    var prefix = (bibBatchPrefix && bibBatchPrefix.value) || "";
+    var start = parseInt((bibBatchStart && bibBatchStart.value) || "", 10);
+    var count = parseInt((bibBatchCount && bibBatchCount.value) || "", 10);
+    var padding = parseInt((bibBatchPadding && bibBatchPadding.value) || "0", 10);
+
+    if (!bibBatchHint) return;
+
+    if (isNaN(start) || isNaN(count) || count <= 0) {
+      bibBatchHint.textContent = "Enter a start number and count to see the bib range.";
+      bibBatchHint.classList.remove("error");
+      return;
+    }
+
+    var last = start + count - 1;
+    var firstStr = String(start);
+    var lastStr = String(last);
+    if (padding > 0) {
+      while (firstStr.length < padding) firstStr = "0" + firstStr;
+      while (lastStr.length < padding) lastStr = "0" + lastStr;
+    }
+    var firstBib = prefix + firstStr;
+    var lastBib = prefix + lastStr;
+
+    bibBatchHint.textContent =
+      "Will generate " + count + " QR code" + (count !== 1 ? "s" : "") +
+      ": " + firstBib + " → " + lastBib +
+      " (each with a unique scannable code + Excel mapping)";
+    bibBatchHint.classList.remove("error");
+  }
+
+  if (bibBatchPrefix) bibBatchPrefix.addEventListener("input", updateBibBatchHint);
+  if (bibBatchStart) bibBatchStart.addEventListener("input", updateBibBatchHint);
+  if (bibBatchCount) bibBatchCount.addEventListener("input", updateBibBatchHint);
+  if (bibBatchPadding) bibBatchPadding.addEventListener("input", updateBibBatchHint);
+
+  if (bibBatchForm) {
+    bibBatchForm.addEventListener("submit", function (event) {
+      event.preventDefault();
+      bibBatchError.hidden = true;
+      bibBatchError.textContent = "";
+
+      var prefix = (bibBatchPrefix && bibBatchPrefix.value) || "";
+      var start = parseInt((bibBatchStart && bibBatchStart.value) || "", 10);
+      var count = parseInt((bibBatchCount && bibBatchCount.value) || "", 10);
+      var padding = parseInt((bibBatchPadding && bibBatchPadding.value) || "0", 10);
+
+      if (isNaN(start)) {
+        bibBatchError.textContent = "Start number is required";
+        bibBatchError.hidden = false;
+        return;
+      }
+      if (isNaN(count) || count <= 0) {
+        bibBatchError.textContent = "Count must be a positive number";
+        bibBatchError.hidden = false;
+        return;
+      }
+
+      // Build the bibs list from prefix + start + count + padding
+      var bibs = [];
+      for (var i = 0; i < count; i++) {
+        var n = String(start + i);
+        while (padding > 0 && n.length < padding) n = "0" + n;
+        bibs.push(prefix + n);
+      }
+
+      var formData = new FormData(bibBatchForm);
+      // Replace the individual fields with the computed bibs string
+      formData.delete("prefix");
+      formData.delete("start");
+      formData.delete("count");
+      formData.delete("padding");
+      formData.set("bibs", bibs.join("\n"));
+      formData.set("label_bibs", "true");
+
+      // Show progress
+      if (bibBatchProgress) {
+        bibBatchProgress.hidden = false;
+        var fill = bibBatchProgress.querySelector(".progress-bar-fill");
+        if (fill) fill.style.width = "50%";
+      }
+
+      var submitBtn = bibBatchForm.querySelector('button[type="submit"]');
+      if (submitBtn) submitBtn.disabled = true;
+
+      fetch("/api/qr/bib-batch", { method: "POST", body: formData })
+        .then(function (response) {
+          if (!response.ok) {
+            return response.json().then(
+              function (body) { throw new Error(body.error || "Request failed"); },
+              function () { throw new Error("Request failed (" + response.status + ")"); }
+            );
+          }
+          return response.blob();
+        })
+        .then(function (blob) {
+          // Update progress to 100%
+          if (bibBatchProgress) {
+            var fill = bibBatchProgress.querySelector(".progress-bar-fill");
+            if (fill) fill.style.width = "100%";
+          }
+          // Trigger download
+          triggerDownload(blob, "qr_bibs_" + (bibs[0] || "") + "_" + (bibs[bibs.length - 1] || "") + ".zip");
+
+          // Update preview
+          var preview = document.getElementById("bibbatch-preview");
+          if (preview) {
+            preview.innerHTML =
+              '<p style="color: var(--success); font-weight: 500;">✓ Download started! ' +
+              'The ZIP contains ' + count + ' QR images + <strong>bib_mapping.xlsx</strong> ' +
+              '(import this into Xluma to map QR codes to bib numbers).</p>';
+          }
+        })
+        .catch(function (err) {
+          bibBatchError.textContent = err.message;
+          bibBatchError.hidden = false;
+        })
+        .finally(function () {
+          if (submitBtn) submitBtn.disabled = false;
+          if (bibBatchProgress) {
+            bibBatchProgress.hidden = true;
+            var fill = bibBatchProgress.querySelector(".progress-bar-fill");
+            if (fill) fill.style.width = "0%";
+          }
+        });
     });
   }
 })();

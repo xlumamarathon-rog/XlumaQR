@@ -28,6 +28,7 @@ from qr_generator import (
     MAX_LOGO_DIMENSION,
     LOGO_HARD_MAX_DIMENSION,
     MAX_PADDING,
+    MAX_BIB_BATCH_SIZE,
     compute_range,
     generate_qr,
     generate_qr_eps,
@@ -36,6 +37,7 @@ from qr_generator import (
     generate_sequence,
     generate_sequence_render_plan,
     generate_sequence_svg,
+    generate_bib_batch,
     get_template,
     images_to_pdf,
     images_to_zip,
@@ -933,6 +935,173 @@ def api_template_preview(template_id: str) -> Response:
     )
     response.headers["Cache-Control"] = "public, max-age=3600"
     return response
+
+
+@app.route("/api/qr/bib-batch", methods=["POST"])
+def api_bib_batch() -> Response:
+    """Generate QR codes with unique codes mapped to bib numbers.
+
+    Accepts a list of bib numbers (which may contain letters, dashes,
+    or any characters), generates a unique ``XLUMA-xxxxxxxx`` code for
+    each, encodes that code in the QR, and returns a ZIP containing:
+
+    * One QR image per bib (PNG or SVG depending on ``format``)
+    * An Excel file (``bib_mapping.xlsx``) with columns:
+      ``qr_code``, ``bib_number``
+
+    The mapping file is what gets imported into the Xluma platform so
+    the mobile app can resolve scanned QR codes back to the correct
+    bib number — regardless of whether the bib contains letters,
+    dashes, or other non-numeric characters.
+
+    Form fields:
+
+    * ``bibs`` (required): comma-separated list of bib numbers, OR
+      one bib per line. Whitespace around each bib is trimmed.
+    * ``box_size`` (default 10): pixel size of each QR module.
+    * ``border`` (default 4): quiet-zone width in modules.
+    * ``template_id`` (optional): design template slug.
+    * ``logo`` (optional): centre logo file (PNG or JPEG).
+    * ``label_bibs`` (default ``true``): if ``true``, the bib number
+      is printed as the QR label so the sticker is human-readable.
+    * ``format`` (default ``zip``): ``zip`` for PNG images, ``zip_svg``
+      for SVG vector images.
+    """
+    raw_bibs = request.form.get("bibs", "").strip()
+    if not raw_bibs:
+        return jsonify({"error": "bibs is required"}), 400
+
+    # Parse bibs: support both comma-separated and newline-separated
+    if "\n" in raw_bibs:
+        bibs = [b.strip() for b in raw_bibs.splitlines() if b.strip()]
+    else:
+        bibs = [b.strip() for b in raw_bibs.split(",") if b.strip()]
+
+    if not bibs:
+        return jsonify({"error": "no valid bib numbers provided"}), 400
+    if len(bibs) > MAX_BIB_BATCH_SIZE:
+        return jsonify({"error": f"too many bibs (max {MAX_BIB_BATCH_SIZE})"}), 400
+
+    # Check for duplicates
+    seen: set[str] = set()
+    for bib in bibs:
+        if bib in seen:
+            return jsonify({"error": f"duplicate bib number: {bib}"}), 400
+        seen.add(bib)
+
+    try:
+        box_size = _parse_int(
+            request.form.get("box_size"),
+            "box_size",
+            default=10,
+            min_value=1,
+            max_value=MAX_BOX_SIZE,
+        )
+        border = _parse_int(
+            request.form.get("border"),
+            "border",
+            default=4,
+            min_value=0,
+            max_value=MAX_BORDER,
+        )
+        template_id = _resolve_template_id_from_request()
+        logo = _load_logo_from_request()
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    assert box_size is not None and border is not None
+
+    label_bibs = request.form.get("label_bibs", "true").strip().lower() != "false"
+    fmt = (request.form.get("format") or "zip").strip().lower()
+    if fmt not in {"zip", "zip_svg"}:
+        return jsonify({"error": "format must be 'zip' or 'zip_svg'"}), 400
+
+    try:
+        items, mapping = generate_bib_batch(
+            bibs,
+            box_size=40,  # Always high-res for print quality
+            border=border,
+            template_id=template_id,
+            logo=logo,
+            label_bibs=label_bibs,
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    # Build the ZIP with QR images + Excel mapping
+    import openpyxl
+
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        # Add QR images
+        for filename, image in items:
+            if fmt == "zip_svg":
+                # Find the matching bib for this filename to get the unique code
+                idx = next(
+                    i for i, (fn, _) in enumerate(items) if fn == filename
+                )
+                entry = mapping[idx]
+                svg_label = entry["bib_number"] if label_bibs else None
+                svg = generate_qr_svg(
+                    entry["qr_code"],
+                    label=svg_label,
+                    box_size=box_size,
+                    border=border,
+                    template_id=template_id,
+                    logo=logo,
+                )
+                svg_filename = filename.replace(".png", ".svg")
+                zf.writestr(svg_filename, svg.encode("utf-8"))
+            else:
+                # PNG: make transparent background
+                image = image.convert("RGBA")
+                gray = image.convert("L")
+                alpha = gray.point(lambda p: 255 - p)
+                image.putalpha(alpha)
+                png_buf = io.BytesIO()
+                image.save(png_buf, format="PNG")
+                zf.writestr(filename, png_buf.getvalue())
+
+        # Add Excel mapping file
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "QR Mapping"
+        ws.append(["QR Code", "Bib Number"])
+        for entry in mapping:
+            ws.append([entry["qr_code"], entry["bib_number"]])
+
+        # Style the header row
+        from openpyxl.styles import Font, PatternFill
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="FF4D2D", end_color="FF4D2D", fill_type="solid")
+        for cell in ws[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+
+        # Auto-width columns
+        for col in ws.columns:
+            max_len = 0
+            col_letter = col[0].column_letter
+            for cell in col:
+                if cell.value:
+                    max_len = max(max_len, len(str(cell.value)))
+            ws.column_dimensions[col_letter].width = max_len + 4
+
+        xlsx_buf = io.BytesIO()
+        wb.save(xlsx_buf)
+        zf.writestr("bib_mapping.xlsx", xlsx_buf.getvalue())
+
+    zip_buffer.seek(0)
+    first_bib = bibs[0].replace("/", "_").replace("\\", "_")
+    last_bib = bibs[-1].replace("/", "_").replace("\\", "_")
+    filename = f"qr_bibs_{first_bib}_{last_bib}.zip"
+
+    return send_file(
+        zip_buffer,
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=filename,
+    )
 
 
 if __name__ == "__main__":

@@ -41,6 +41,7 @@ import copy
 import functools
 import io
 import os
+import secrets
 import xml.sax.saxutils
 import zipfile
 from typing import Iterable, Iterator
@@ -80,6 +81,8 @@ __all__ = [
     "generate_sequence",
     "generate_sequence_svg",
     "generate_sequence_render_plan",
+    "generate_bib_batch",
+    "generate_unique_code",
     "images_to_zip",
     "images_to_pdf",
     "iter_batch_with_progress",
@@ -97,6 +100,7 @@ __all__ = [
     "MAX_LOGO_DIMENSION",
     "LOGO_HARD_MAX_DIMENSION",
     "LOGO_WORK_SIZE",
+    "MAX_BIB_BATCH_SIZE",
 ]
 
 
@@ -164,6 +168,7 @@ MAX_LOGO_BYTES = 2 * 1024 * 1024
 MAX_LOGO_DIMENSION = 1024
 LOGO_HARD_MAX_DIMENSION = 4096
 LOGO_WORK_SIZE = 1024
+MAX_BIB_BATCH_SIZE = 5000
 
 
 # --- Label rendering -----------------------------------------------------
@@ -1318,6 +1323,105 @@ def generate_sequence(
             logo=logo,
         )
         yield f"{prefix}{n}.png", image
+
+
+def generate_unique_code() -> str:
+    """Generate a unique 7-digit numeric code, like a MYLAPS chip ID.
+
+    Example output: ``4839201``
+    """
+    return str(secrets.randbelow(9000000) + 1000000)
+
+
+def generate_bib_batch(
+    bibs: list[str],
+    *,
+    box_size: int = 10,
+    border: int = 4,
+    template_id: str | None = None,
+    logo: Image.Image | None = None,
+    label_bibs: bool = True,
+) -> tuple[list[tuple[str, Image.Image]], list[dict[str, str]]]:
+    """Generate QR codes with unique codes mapped to bib numbers.
+
+    For each bib in ``bibs``, a unique code (``XLUMA-xxxxxxxx``) is
+    generated and encoded in the QR. The QR label shows the bib number
+    (when ``label_bibs=True``) so the printed sticker is human-readable.
+
+    Parameters
+    ----------
+    bibs:
+        List of bib number strings (e.g. ``["D-001", "D-002", "42"]``).
+        Duplicates are rejected with :class:`ValueError`. Empty strings
+        are rejected. Max length is :data:`MAX_BIB_BATCH_SIZE`.
+    box_size:
+        Pixel size of each QR module (default 10).
+    border:
+        Quiet-zone width in modules (default 4).
+    template_id:
+        Optional design template slug.
+    logo:
+        Optional centre logo image.
+    label_bibs:
+        If ``True`` (default), the bib number is printed as the QR label
+        so the physical sticker is human-readable.
+
+    Returns
+    -------
+    tuple[list[tuple[str, Image.Image]], list[dict[str, str]]]
+        A 2-tuple of:
+        * ``items``: list of ``(filename, PIL.Image.Image)`` pairs. The
+          filename is ``<bib>.png`` (with path-unsafe characters replaced
+          by ``_``).
+        * ``mapping``: list of dicts with keys ``qr_code`` and
+          ``bib_number``, one per bib, in the same order as ``bibs``.
+
+    Raises
+    ------
+    ValueError
+        If ``bibs`` is empty, exceeds :data:`MAX_BIB_BATCH_SIZE`,
+        contains duplicates, or contains empty strings.
+    """
+    if not bibs:
+        raise ValueError("bibs list must not be empty")
+    if len(bibs) > MAX_BIB_BATCH_SIZE:
+        raise ValueError(f"bibs list must be <= {MAX_BIB_BATCH_SIZE} entries")
+
+    # Validate: no empty strings, no duplicates
+    seen: set[str] = set()
+    for bib in bibs:
+        if not bib.strip():
+            raise ValueError("bib numbers must not be empty")
+        if bib in seen:
+            raise ValueError(f"duplicate bib number: {bib}")
+        seen.add(bib)
+
+    items: list[tuple[str, Image.Image]] = []
+    mapping: list[dict[str, str]] = []
+    used_codes: set[str] = set()
+
+    for bib in bibs:
+        # Generate unique numeric code, retry on collision
+        unique_code = generate_unique_code()
+        while unique_code in used_codes:
+            unique_code = generate_unique_code()
+        used_codes.add(unique_code)
+
+        label = bib if label_bibs else None
+        image = generate_qr(
+            unique_code,
+            label=label,
+            box_size=box_size,
+            border=border,
+            template_id=template_id,
+            logo=logo,
+        )
+        # Safe filename: replace path-unsafe chars with underscore
+        safe_bib = bib.replace("/", "_").replace("\\", "_").replace("..", "_")
+        items.append((f"{safe_bib}.png", image))
+        mapping.append({"qr_code": unique_code, "bib_number": bib})
+
+    return items, mapping
 
 
 def _pack_zip(
