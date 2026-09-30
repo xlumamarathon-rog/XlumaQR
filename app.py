@@ -20,6 +20,13 @@ from typing import Any, Iterator
 from flask import Flask, Response, jsonify, render_template, request, send_file, stream_with_context
 from PIL import Image, UnidentifiedImageError
 
+from barcode_generator import (
+    barcode_download,
+    generate_barcode_eps,
+    generate_barcode_png,
+    generate_barcode_svg,
+    iter_barcode_batch,
+)
 from qr_generator import (
     MAX_BORDER,
     MAX_BOX_SIZE,
@@ -335,6 +342,10 @@ def api_single() -> Response:
     if output_format not in {"png", "svg", "eps", "print_png"}:
         return jsonify({"error": "output_format must be 'png', 'svg', 'eps', or 'print_png'"}), 400
 
+    symbol = (request.form.get("symbol") or "qr").strip().lower()
+    if symbol not in {"qr", "barcode"}:
+        return jsonify({"error": "symbol must be 'qr' or 'barcode'"}), 400
+
     try:
         box_size = _parse_int(
             request.form.get("box_size"),
@@ -350,12 +361,39 @@ def api_single() -> Response:
             min_value=0,
             max_value=MAX_BORDER,
         )
-        template_id = _resolve_template_id_from_request()
-        logo = _load_logo_from_request()
+        if symbol == "barcode":
+            template_id = None
+            logo = None
+        else:
+            template_id = _resolve_template_id_from_request()
+            logo = _load_logo_from_request()
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
     assert box_size is not None and border is not None  # defaults guarantee non-None
+
+    if symbol == "barcode":
+        module_px = 8 if output_format == "print_png" else max(2, min(box_size, 12))
+        try:
+            if output_format == "eps":
+                raw = generate_barcode_eps(data, label=label)
+                mime, name, attach = "application/postscript", "barcode.eps", True
+            elif output_format == "svg":
+                raw = generate_barcode_svg(data, label=label).encode("utf-8")
+                mime, name, attach = "image/svg+xml", "barcode.svg", False
+            else:
+                raw = generate_barcode_png(
+                    data, label=label, module_px=module_px, extra_quiet=border
+                )
+                mime, name, attach = "image/png", "barcode.png", output_format == "print_png"
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return send_file(
+            io.BytesIO(raw),
+            mimetype=mime,
+            as_attachment=attach,
+            download_name=name,
+        )
 
     if output_format == "eps":
         try:
@@ -464,6 +502,24 @@ def api_batch() -> Response:
     fmt = parsed["fmt"]
     first_n = parsed["first_n"]
     last_n = parsed["last_n"]
+
+    if parsed["symbol"] == "barcode":
+        try:
+            payload: bytes | None = None
+            for token in iter_barcode_batch(parsed):
+                if token[0] == "result":
+                    payload = token[1]
+            if payload is None:
+                return jsonify({"error": "internal error: empty batch payload"}), 500
+        except ValueError as exc:
+            return jsonify({"error": f"batch could not be encoded: {exc}"}), 400
+        mimetype, filename = barcode_download(parsed)
+        return send_file(
+            io.BytesIO(payload),
+            mimetype=mimetype,
+            as_attachment=True,
+            download_name=filename,
+        )
 
     try:
         if fmt == "pdf":
@@ -624,8 +680,15 @@ def _parse_batch_form() -> tuple[dict[str, Any] | None, str | None]:
             min_value=0,
             max_value=MAX_BORDER,
         )
-        template_id = _resolve_template_id_from_request()
-        logo = _load_logo_from_request()
+        symbol = (request.form.get("symbol") or "qr").strip().lower()
+        if symbol not in {"qr", "barcode"}:
+            return None, "symbol must be 'qr' or 'barcode'"
+        if symbol == "barcode":
+            template_id = None
+            logo = None
+        else:
+            template_id = _resolve_template_id_from_request()
+            logo = _load_logo_from_request()
     except ValueError as exc:
         return None, str(exc)
 
@@ -657,8 +720,14 @@ def _parse_batch_form() -> tuple[dict[str, Any] | None, str | None]:
         return None, f"label_template must be <= {MAX_DATA_LENGTH} characters"
 
     fmt = (request.form.get("format") or "zip").strip().lower()
-    if fmt not in {"zip", "zip_svg", "zip_eps", "pdf", "pdf_single"}:
-        return None, "format must be 'zip', 'zip_svg', 'zip_eps', 'pdf', or 'pdf_single'"
+    if fmt not in {"zip", "zip_jpg", "zip_svg", "zip_eps", "pdf", "pdf_single"}:
+        return None, "format must be 'zip', 'zip_jpg', 'zip_svg', 'zip_eps', 'pdf', or 'pdf_single'"
+    if fmt == "zip_jpg" and symbol != "barcode":
+        return None, "JPG is only available for barcodes"
+
+    name_by = (request.form.get("name_by") or "barcode").strip().lower()
+    if symbol == "barcode" and name_by not in {"sequence", "barcode"}:
+        return None, "name_by must be 'sequence' or 'barcode'"
 
     # Validate the range up front so we can return a clean 400 before we
     # start rendering hundreds of QR codes.
@@ -684,6 +753,8 @@ def _parse_batch_form() -> tuple[dict[str, Any] | None, str | None]:
             "total": len(numbers),
             "template_id": template_id,
             "logo": logo,
+            "symbol": symbol,
+            "name_by": name_by,
         },
         None,
     )
@@ -719,7 +790,11 @@ def api_batch_stream() -> Response:
     first_n: str = parsed["first_n"]
     last_n: str = parsed["last_n"]
 
-    if fmt == "pdf" or fmt == "pdf_single":
+    if parsed["symbol"] == "barcode":
+        mimetype, filename = barcode_download(parsed)
+        items = None
+        packer = lambda src: iter_barcode_batch(parsed)
+    elif fmt == "pdf" or fmt == "pdf_single":
         mimetype = "application/pdf"
         filename = f"qr_batch_{first_n}_{last_n}.pdf"
     else:
@@ -729,7 +804,9 @@ def api_batch_stream() -> Response:
         mimetype = "application/zip"
         filename = f"qr_batch_{first_n}_{last_n}.zip"
 
-    if fmt == "zip_svg":
+    if parsed["symbol"] == "barcode":
+        pass
+    elif fmt == "zip_svg":
         items = generate_sequence_svg(
             start=parsed["start"],
             count=parsed["count"],

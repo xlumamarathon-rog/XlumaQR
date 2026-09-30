@@ -169,6 +169,18 @@
         hidden
       >
         <form id="batch-form" class="qr-form">
+          <fieldset class="row mode-toggle">
+            <legend>Code type</legend>
+            <label>
+              <input type="radio" name="symbol" value="qr" checked />
+              QR code
+            </label>
+            <label>
+              <input type="radio" name="symbol" value="barcode" />
+              Barcode (Code 128)
+            </label>
+          </fieldset>
+
           <div class="row two-col">
             <div>
               <label for="batch-start">Start number</label>
@@ -228,6 +240,21 @@
               placeholder="e.g. 1100"
             />
           </div>
+
+          <fieldset class="row mode-toggle" id="batch-barcode-options" hidden>
+            <legend>Barcode image name</legend>
+            <label>
+              <input type="radio" name="name_by" value="sequence" />
+              Sequence (1, 2, 3…)
+            </label>
+            <label>
+              <input type="radio" name="name_by" value="barcode" checked />
+              Barcode ID
+            </label>
+            <p class="format-toggle-note">
+              The ZIP also includes barcode_mapping.xlsx. Column A is the sequence (1, 2, 3). Column B is the barcode ID.
+            </p>
+          </fieldset>
 
           <div class="row">
             <button type="button" id="batch-advanced-toggle" class="advanced-toggle">
@@ -289,7 +316,7 @@
             </div>
           </div>
 
-          <fieldset class="row design-section" data-form="batch">
+          <fieldset class="row design-section" data-form="batch" id="batch-design">
             <legend>Design (optional)</legend>
             <div class="row">
               <label for="batch-template-category">Template category</label>
@@ -337,7 +364,7 @@
               title="One QR per page, vector, transparent background. Perfect for placing on bib designs."
             >
               <input type="radio" name="format" value="pdf_single" checked />
-              PDF (1 QR per page, transparent, vector)
+              PDF (1 <span class="code-noun">QR</span> per page, transparent, vector)
             </label>
             <label
               title="Each QR is a vector EPS file. Opens in Photoshop, Illustrator, InDesign."
@@ -350,6 +377,12 @@
             >
               <input type="radio" name="format" value="zip_svg" />
               ZIP (SVG vectors)
+            </label>
+            <label id="format-zip-jpg" hidden
+              title="High-resolution JPEG of each barcode, plus the Excel map."
+            >
+              <input type="radio" name="format" value="zip_jpg" />
+              ZIP (JPG, high quality)
             </label>
             <label
               title="High-res transparent PNG per QR."
@@ -389,7 +422,7 @@
           </div>
         </form>
         <div id="batch-preview" class="preview">
-          <p class="preview-empty">A sample QR will appear here once you configure the range.</p>
+          <p class="preview-empty">A sample of the first code will appear here once you configure the range.</p>
         </div>
       </section>
 

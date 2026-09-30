@@ -779,23 +779,21 @@
     if (borderEl && borderEl.value) {
       formData.set("border", borderEl.value);
     }
-    var templateIdEl = batchForm.elements["template_id"];
-    if (templateIdEl && templateIdEl.value) {
-      formData.set("template_id", templateIdEl.value);
-    }
-    // FormData.set on a file input only copies the empty .value string,
-    // so reach for .files[0] like the existing Batch submit handler.
-    // Review v1 issue 2: the logo is only attached when ``includeLogo``
-    // is set (slow path: template tile click, logo file change, logo
-    // Clear). On the fast path (numeric/text-input keystrokes) the
-    // logo is omitted to avoid re-uploading up to 2 MB per debounced
-    // keystroke.
-    if (includeLogo) {
-      var batchLogoInput = document.getElementById("batch-logo");
-      if (batchLogoInput && batchLogoInput.files && batchLogoInput.files.length > 0) {
-        formData.set("logo", batchLogoInput.files[0]);
+    var symbol = currentSymbol();
+    formData.set("symbol", symbol);
+    if (symbol !== "barcode") {
+      var templateIdEl = batchForm.elements["template_id"];
+      if (templateIdEl && templateIdEl.value) {
+        formData.set("template_id", templateIdEl.value);
+      }
+      if (includeLogo) {
+        var batchLogoInput = document.getElementById("batch-logo");
+        if (batchLogoInput && batchLogoInput.files && batchLogoInput.files.length > 0) {
+          formData.set("logo", batchLogoInput.files[0]);
+        }
       }
     }
+    var templateIdEl = symbol === "barcode" ? null : batchForm.elements["template_id"];
 
     if (batchPreviewAbort) {
       batchPreviewAbort.abort();
@@ -851,30 +849,27 @@
         // preview fetch). On the keystroke fast path the preview was
         // rendered without the logo, so the HD download mirrors that
         // and stays consistent with what the user sees.
-        var hdFormData = new FormData();
         hdFormData.set("data", dataValue);
+        hdFormData.set("symbol", symbol);
         if (labelValue) {
           hdFormData.set("label", labelValue);
         }
         if (borderEl && borderEl.value) {
           hdFormData.set("border", borderEl.value);
         }
-        if (templateIdEl && templateIdEl.value) {
+        if (symbol !== "barcode" && templateIdEl && templateIdEl.value) {
           hdFormData.set("template_id", templateIdEl.value);
         }
-        if (includeLogo) {
+        if (symbol !== "barcode" && includeLogo) {
           var hdLogoInput = document.getElementById("batch-logo");
           if (hdLogoInput && hdLogoInput.files && hdLogoInput.files.length > 0) {
             hdFormData.set("logo", hdLogoInput.files[0]);
           }
         }
-        // ``paddedFirst`` is the zero-padded first range value (e.g.
-        // "0101"), matching what generate_sequence would emit on the
-        // server. It only contains digits, so it is filename-safe.
         appendPreviewDownloadButton(
           batchPreview,
           blob,
-          "qr_" + paddedFirst + ".png",
+          (symbol === "barcode" ? "barcode_" : "qr_") + paddedFirst + ".png",
           { formData: hdFormData, inflightSlot: batchHdInflight }
         );
       })
@@ -902,6 +897,47 @@
       }
     });
   }
+
+  function currentSymbol() {
+    if (!batchForm) return "qr";
+    var checked = batchForm.querySelector('input[name="symbol"]:checked');
+    return checked ? checked.value : "qr";
+  }
+
+  function codeNoun(count) {
+    var barcode = currentSymbol() === "barcode";
+    if (count === 1) return barcode ? "barcode" : "QR code";
+    return barcode ? "barcodes" : "QR codes";
+  }
+
+  function syncSymbolUi() {
+    var barcode = currentSymbol() === "barcode";
+    var design = document.getElementById("batch-design");
+    if (design) {
+      if (barcode) design.setAttribute("hidden", "");
+      else design.removeAttribute("hidden");
+    }
+    var barcodeOptions = document.getElementById("batch-barcode-options");
+    if (barcodeOptions) {
+      if (barcode) barcodeOptions.removeAttribute("hidden");
+      else barcodeOptions.setAttribute("hidden", "");
+    }
+    var jpgChoice = document.getElementById("format-zip-jpg");
+    if (jpgChoice) {
+      if (barcode) jpgChoice.removeAttribute("hidden");
+      else jpgChoice.setAttribute("hidden", "");
+    }
+    var entered = barcode && syncSymbolUi.last !== "barcode";
+    var left = !barcode && syncSymbolUi.last === "barcode";
+    syncSymbolUi.last = barcode ? "barcode" : "qr";
+    var jpgRadio = batchForm && batchForm.querySelector('input[name="format"][value="zip_jpg"]');
+    if (entered && jpgRadio) jpgRadio.checked = true;
+    if (left && jpgRadio && jpgRadio.checked) {
+      var pdfRadio = batchForm.querySelector('input[name="format"][value="pdf_single"]');
+      if (pdfRadio) pdfRadio.checked = true;
+    }
+  }
+  syncSymbolUi.last = "qr";
 
   function getMode() {
     var radios = batchForm.querySelectorAll('input[name="mode"]');
@@ -979,8 +1015,8 @@
     batchHint.textContent =
       "Will generate " +
       count +
-      " QR code" +
-      (count === 1 ? "" : "s") +
+      " " +
+      codeNoun(count) +
       ": " +
       firstStr +
       " -> " +
@@ -996,9 +1032,14 @@
       if (event.target && event.target.name === "mode") {
         updateModeVisibility();
       }
+      if (event.target && event.target.name === "symbol") {
+        syncSymbolUi();
+        updateHint();
+      }
       scheduleBatchPreview();
     });
     updateModeVisibility();
+    syncSymbolUi();
 
     batchForm.addEventListener("submit", function (event) {
       event.preventDefault();
@@ -1018,9 +1059,16 @@
       // Include the logo file separately (FormData.set on a file input
       // copies only the .value string, which is empty / fake-pathed for
       // security reasons; .files[0] is the real File object).
-      var batchLogoInput = document.getElementById("batch-logo");
-      if (batchLogoInput && batchLogoInput.files && batchLogoInput.files.length > 0) {
-        formData.set("logo", batchLogoInput.files[0]);
+      if (currentSymbol() !== "barcode") {
+        var batchLogoInput = document.getElementById("batch-logo");
+        if (batchLogoInput && batchLogoInput.files && batchLogoInput.files.length > 0) {
+          formData.set("logo", batchLogoInput.files[0]);
+        }
+      }
+      formData.set("symbol", currentSymbol());
+      if (currentSymbol() === "barcode") {
+        var nameBy = batchForm.querySelector('input[name="name_by"]:checked');
+        formData.set("name_by", nameBy ? nameBy.value : "barcode");
       }
       if (mode === "count") {
         formData.set("count", batchForm.elements["count"].value);
@@ -1047,7 +1095,7 @@
         var barRestore = batchProgress.querySelector(".progress-bar-container");
         if (barRestore) barRestore.removeAttribute("hidden");
         if (batchProgressText) {
-          batchProgressText.textContent = "Generating " + codeCount + " QR code" + (codeCount === 1 ? "" : "s") + "...";
+          batchProgressText.textContent = "Generating " + codeCount + " " + codeNoun(codeCount) + "...";
         }
         if (batchProgressFill) batchProgressFill.style.width = "0%";
         if (batchProgressPercent) batchProgressPercent.textContent = "0%";
