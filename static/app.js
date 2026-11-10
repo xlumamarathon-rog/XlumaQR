@@ -849,6 +849,7 @@
         // preview fetch). On the keystroke fast path the preview was
         // rendered without the logo, so the HD download mirrors that
         // and stays consistent with what the user sees.
+        var hdFormData = new FormData();
         hdFormData.set("data", dataValue);
         hdFormData.set("symbol", symbol);
         if (labelValue) {
@@ -922,20 +923,10 @@
       if (barcode) barcodeOptions.removeAttribute("hidden");
       else barcodeOptions.setAttribute("hidden", "");
     }
-    var jpgChoice = document.getElementById("format-zip-jpg");
-    if (jpgChoice) {
-      if (barcode) jpgChoice.removeAttribute("hidden");
-      else jpgChoice.setAttribute("hidden", "");
-    }
     var entered = barcode && syncSymbolUi.last !== "barcode";
-    var left = !barcode && syncSymbolUi.last === "barcode";
     syncSymbolUi.last = barcode ? "barcode" : "qr";
     var jpgRadio = batchForm && batchForm.querySelector('input[name="format"][value="zip_jpg"]');
     if (entered && jpgRadio) jpgRadio.checked = true;
-    if (left && jpgRadio && jpgRadio.checked) {
-      var pdfRadio = batchForm.querySelector('input[name="format"][value="pdf_single"]');
-      if (pdfRadio) pdfRadio.checked = true;
-    }
   }
   syncSymbolUi.last = "qr";
 

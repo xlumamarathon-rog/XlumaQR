@@ -47,7 +47,7 @@ import zipfile
 from typing import Iterable, Iterator
 
 import qrcode
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps
 from qrcode.constants import ERROR_CORRECT_H, ERROR_CORRECT_M
 from qrcode.image.styledpil import StyledPilImage
 from qrcode.image.styles.colormasks import (
@@ -994,6 +994,157 @@ def _render_label_badge(
     return _pad_logo(text_img, target_size_px)
 
 
+def _lerp_rgb(
+    start: tuple[int, int, int],
+    end: tuple[int, int, int],
+    t: float,
+) -> tuple[int, int, int]:
+    """Match ``qrcode``'s truncating ``interp_num`` so gradients stay aligned."""
+    return tuple(int(end[i] * t + start[i] * (1 - t)) for i in range(3))  # type: ignore[return-value]
+
+
+def _module_alpha(image: Image.Image) -> Image.Image:
+    """How far each pixel sits from the white background toward black paint.
+
+    Styled drawers paint black modules on white and leave gray only on
+    antialiased edges. That gray is the blend factor the color mask used
+    to apply one pixel at a time.
+    """
+    red, green, blue = image.convert("RGB").split()
+    inv_red = ImageOps.invert(red)
+    inv_green = ImageOps.invert(green)
+    inv_blue = ImageOps.invert(blue)
+    pair = ImageChops.blend(inv_red, inv_green, 0.5)
+    return ImageChops.blend(pair, inv_blue, 1 / 3)
+
+
+def _horizontal_field(
+    size: tuple[int, int],
+    left: tuple[int, int, int],
+    right: tuple[int, int, int],
+) -> Image.Image:
+    width, _height = size
+    row = Image.new("RGB", (max(width, 1), 1))
+    pixels = row.load()
+    for x in range(width):
+        pixels[x, 0] = _lerp_rgb(left, right, x / width if width else 0)
+    return row.resize(size, Image.Resampling.NEAREST)
+
+
+def _vertical_field(
+    size: tuple[int, int],
+    top: tuple[int, int, int],
+    bottom: tuple[int, int, int],
+) -> Image.Image:
+    width, height = size
+    # qrcode's vertical mask divides by the image width, and every QR
+    # canvas we build is square, so this matches that sweep.
+    column = Image.new("RGB", (1, max(height, 1)))
+    pixels = column.load()
+    for y in range(height):
+        pixels[0, y] = _lerp_rgb(top, bottom, y / width if width else 0)
+    return column.resize(size, Image.Resampling.NEAREST)
+
+
+def _sampled_gradient(
+    size: tuple[int, int],
+    sample: int,
+    color_at,
+) -> Image.Image:
+    """Build a smooth gradient on a small grid and scale it up.
+
+    A radial or square sweep changes slowly, so a few hundred samples
+    resized with bilinear filtering is indistinguishable from visiting
+    every print-resolution pixel in Python.
+    """
+    side = max(2, min(sample, size[0], size[1]))
+    small = Image.new("RGB", (side, side))
+    pixels = small.load()
+    for y in range(side):
+        for x in range(side):
+            pixels[x, y] = color_at(x, y, side)
+    return small.resize(size, Image.Resampling.BILINEAR)
+
+
+def _foreground_field(mask: object, size: tuple[int, int]) -> Image.Image | None:
+    """Return the mask's foreground colour image, or ``None`` to keep the drawing."""
+    if isinstance(mask, SolidFillColorMask):
+        front = tuple(mask.front_color[:3])
+        back = tuple(mask.back_color[:3])
+        if front == (0, 0, 0) and back == (255, 255, 255):
+            return None
+        return Image.new("RGB", size, front)
+    if isinstance(mask, HorizontalGradiantColorMask):
+        return _horizontal_field(
+            size, tuple(mask.left_color[:3]), tuple(mask.right_color[:3])
+        )
+    if isinstance(mask, VerticalGradiantColorMask):
+        return _vertical_field(
+            size, tuple(mask.top_color[:3]), tuple(mask.bottom_color[:3])
+        )
+    if isinstance(mask, RadialGradiantColorMask):
+        center = tuple(mask.center_color[:3])
+        edge = tuple(mask.edge_color[:3])
+
+        def color_at(x: int, y: int, side: int) -> tuple[int, int, int]:
+            half = side / 2
+            norm = ((x - half) ** 2 + (y - half) ** 2) ** 0.5 / (2**0.5 * half)
+            return _lerp_rgb(center, edge, norm)
+
+        return _sampled_gradient(size, 256, color_at)
+    if isinstance(mask, SquareGradiantColorMask):
+        center = tuple(mask.center_color[:3])
+        edge = tuple(mask.edge_color[:3])
+
+        def color_at(x: int, y: int, side: int) -> tuple[int, int, int]:
+            half = side / 2
+            norm = max(abs(x - half), abs(y - half)) / half
+            return _lerp_rgb(center, edge, norm)
+
+        return _sampled_gradient(size, 256, color_at)
+    return None
+
+
+def _recolor_modules(image: Image.Image, mask: object) -> Image.Image | None:
+    """Apply a template colour mask without a per-pixel Python loop.
+
+    Returns ``None`` when the mask is not one of the built-in kinds, so
+    the caller can fall back to qrcode's own implementation.
+    """
+    field = _foreground_field(mask, image.size)
+    if field is None:
+        if isinstance(mask, SolidFillColorMask):
+            return image
+        return None
+    back = tuple(mask.back_color[:3])
+    coloured = field.convert("RGBA")
+    coloured.putalpha(_module_alpha(image))
+    base = Image.new("RGBA", image.size, (*back, 255))
+    merged = Image.alpha_composite(base, coloured)
+    if image.mode == "RGBA":
+        return merged
+    return merged.convert("RGB")
+
+
+class _FastStyledPilImage(StyledPilImage):
+    """Styled QR image whose colour mask runs in Pillow instead of Python.
+
+    ``QRColorMask.apply_mask`` visits every pixel from the interpreter.
+    At the print ``box_size`` used for JPEG batches that is most of a
+    minute on a typical laptop. The modules are already drawn in black,
+    so recoloring them is one composite.
+    """
+
+    def process(self) -> None:
+        recolored = _recolor_modules(self._img, self.color_mask)
+        if recolored is None:
+            super().process()
+            return
+        self._img = recolored
+        if self.embedded_image:
+            self.draw_embedded_image()
+
+
 def generate_qr(
     data: str,
     label: str | None = None,
@@ -1132,7 +1283,7 @@ def generate_qr(
             embedded_image = None
 
         styled = qr.make_image(
-            image_factory=StyledPilImage,
+            image_factory=_FastStyledPilImage,
             module_drawer=drawer,
             color_mask=color_mask,
             embedded_image=embedded_image,
@@ -1470,6 +1621,33 @@ def _pack_zip(
     yield ("result", buffer.getvalue())
 
 
+def _pack_zip_jpg(items: Iterable[tuple[str, Image.Image]]) -> Iterator[tuple]:
+    """Pack QR images as high-quality JPEGs.
+
+    JPEG has no alpha channel, so the render keeps its white background.
+    Quality 95 with no chroma subsampling keeps module edges sharp enough
+    to scan after a bib is printed. Filenames that arrived as ``.png``
+    are stored as ``.jpg``.
+    """
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for index, (filename, image) in enumerate(items):
+            if filename.lower().endswith(".png"):
+                filename = filename[:-4] + ".jpg"
+            jpg_buf = io.BytesIO()
+            image.convert("RGB").save(
+                jpg_buf,
+                format="JPEG",
+                quality=95,
+                subsampling=0,
+                optimize=True,
+                dpi=(300, 300),
+            )
+            zf.writestr(filename, jpg_buf.getvalue())
+            yield ("progress", index, filename)
+    yield ("result", buffer.getvalue())
+
+
 def _pack_pdf(
     items: Iterable[tuple[str, Image.Image]],
     page_size: tuple[float, float] = LETTER,
@@ -1651,10 +1829,12 @@ def iter_batch_with_progress(
     """
     if fmt == "zip":
         yield from _pack_zip(items)
+    elif fmt == "zip_jpg":
+        yield from _pack_zip_jpg(items)
     elif fmt == "pdf":
         yield from _pack_pdf(items)
     else:
-        raise ValueError("fmt must be 'zip' or 'pdf'")
+        raise ValueError("fmt must be 'zip', 'zip_jpg', or 'pdf'")
 
 
 # --- Vector rendering (SVG single + ZIP-of-SVGs + native vector PDF) ---

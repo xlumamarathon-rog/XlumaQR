@@ -1700,3 +1700,26 @@ def test_batch_stream_format_zip_svg_terminal_event(client) -> None:
             entry = zf.read(name)
             head = entry.lstrip()
             assert head.startswith(b"<?xml") or head.startswith(b"<svg")
+
+
+def test_batch_format_zip_jpg_returns_jpegs(client) -> None:
+    """QR batches accept the same high-quality JPEG ZIP as barcodes."""
+    rv = client.post(
+        "/api/qr/batch",
+        data={
+            "start": "1001",
+            "count": "2",
+            "prefix": "qr_",
+            "format": "zip_jpg",
+            "template_id": "running-energy",
+        },
+    )
+    assert rv.status_code == 200, rv.get_json()
+    assert rv.mimetype == "application/zip"
+    assert "qr_batch_1001_1002_jpg.zip" in rv.headers["Content-Disposition"]
+    with zipfile.ZipFile(io.BytesIO(rv.data)) as zf:
+        assert zf.namelist() == ["qr_1001.jpg", "qr_1002.jpg"]
+        for name in zf.namelist():
+            jpg = zf.read(name)
+            assert jpg[:3] == b"\xff\xd8\xff"
+            assert len(jpg) > 8000

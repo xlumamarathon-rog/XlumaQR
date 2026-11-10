@@ -611,6 +611,26 @@ def api_batch() -> Response:
             payload = eps_buffer.getvalue()
             mimetype = "application/zip"
             filename = f"qr_batch_{first_n}_{last_n}_eps.zip"
+        elif fmt == "zip_jpg":
+            items = generate_sequence(
+                start=parsed["start"],
+                count=parsed["count"],
+                end=parsed["end"],
+                data_template=parsed["data_template"],
+                label_template=parsed["label_template"],
+                padding=parsed["padding"],
+                prefix=parsed["prefix"],
+                box_size=40,
+                border=parsed["border"],
+                template_id=parsed["template_id"],
+                logo=parsed["logo"],
+            )
+            payload = b""
+            for token in iter_batch_with_progress(items, "zip_jpg"):
+                if token[0] == "result":
+                    payload = token[1]
+            mimetype = "application/zip"
+            filename = f"qr_batch_{first_n}_{last_n}_jpg.zip"
         else:
             # PNG batch: render at high resolution (box_size=40) for
             # print quality. The user's box_size setting is overridden
@@ -722,9 +742,6 @@ def _parse_batch_form() -> tuple[dict[str, Any] | None, str | None]:
     fmt = (request.form.get("format") or "zip").strip().lower()
     if fmt not in {"zip", "zip_jpg", "zip_svg", "zip_eps", "pdf", "pdf_single"}:
         return None, "format must be 'zip', 'zip_jpg', 'zip_svg', 'zip_eps', 'pdf', or 'pdf_single'"
-    if fmt == "zip_jpg" and symbol != "barcode":
-        return None, "JPG is only available for barcodes"
-
     name_by = (request.form.get("name_by") or "barcode").strip().lower()
     if symbol == "barcode" and name_by not in {"sequence", "barcode"}:
         return None, "name_by must be 'sequence' or 'barcode'"
@@ -802,7 +819,8 @@ def api_batch_stream() -> Response:
         # delivered as ``application/zip`` archives; the entries inside
         # carry the appropriate per-file extension.
         mimetype = "application/zip"
-        filename = f"qr_batch_{first_n}_{last_n}.zip"
+        jpg_suffix = "_jpg" if fmt == "zip_jpg" else ""
+        filename = f"qr_batch_{first_n}_{last_n}{jpg_suffix}.zip"
 
     if parsed["symbol"] == "barcode":
         pass
@@ -874,6 +892,21 @@ def api_batch_stream() -> Response:
 
         items = None
         packer = _eps_packer
+    elif fmt == "zip_jpg":
+        items = generate_sequence(
+            start=parsed["start"],
+            count=parsed["count"],
+            end=parsed["end"],
+            data_template=parsed["data_template"],
+            label_template=parsed["label_template"],
+            padding=parsed["padding"],
+            prefix=parsed["prefix"],
+            box_size=40,
+            border=parsed["border"],
+            template_id=parsed["template_id"],
+            logo=parsed["logo"],
+        )
+        packer = lambda src: iter_batch_with_progress(src, "zip_jpg")
     else:
         # PNG batch: render at high resolution (box_size=40) for print
         items = generate_sequence(
