@@ -624,9 +624,18 @@ def api_batch() -> Response:
                 border=parsed["border"],
                 template_id=parsed["template_id"],
                 logo=parsed["logo"],
+                id_start=parsed.get("qr_id_start"),
             )
+            sequence_ids, qr_ids = _sequence_map(parsed)
             payload = b""
-            for token in iter_batch_with_progress(items, "zip_jpg"):
+            for token in iter_batch_with_progress(
+                items,
+                "zip_jpg",
+                sequence_ids=sequence_ids,
+                qr_ids=qr_ids,
+                save_as_qr_id=parsed["save_as_qr_id"],
+                jpg_prefix=parsed["prefix"],
+            ):
                 if token[0] == "result":
                     payload = token[1]
             mimetype = "application/zip"
@@ -647,6 +656,7 @@ def api_batch() -> Response:
                 border=parsed["border"],
                 template_id=parsed["template_id"],
                 logo=parsed["logo"],
+                id_start=parsed.get("qr_id_start"),
             )
             payload = images_to_zip(items)
             mimetype = "application/zip"
@@ -662,6 +672,24 @@ def api_batch() -> Response:
         as_attachment=True,
         download_name=filename,
     )
+
+
+def _sequence_map(parsed: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Return ``(1, 2, 3…, encoded QR IDs)`` for one batch.
+
+    The QR ID is the Sequence ID start range (50001, 50002, …).
+    The sequence column is always 1, 2, 3…
+    """
+    qr_numbers = compute_range(
+        parsed["start"],
+        count=parsed["count"],
+        end=parsed["end"],
+        padding=parsed["padding"],
+    )
+    template = parsed["data_template"]
+    encoded = [template.replace("{n}", n).replace("{id}", n) for n in qr_numbers]
+    sequence = [str(index) for index in range(1, len(qr_numbers) + 1)]
+    return sequence, encoded
 
 
 def _parse_batch_form() -> tuple[dict[str, Any] | None, str | None]:
@@ -703,9 +731,12 @@ def _parse_batch_form() -> tuple[dict[str, Any] | None, str | None]:
         symbol = (request.form.get("symbol") or "qr").strip().lower()
         if symbol not in {"qr", "barcode"}:
             return None, "symbol must be 'qr' or 'barcode'"
+        qr_id_raw = (request.form.get("qr_id_start") or "").strip()
+        qr_id_start = _parse_int(qr_id_raw, "qr_id_start") if qr_id_raw else None
         if symbol == "barcode":
             template_id = None
             logo = None
+            qr_id_start = None
         else:
             template_id = _resolve_template_id_from_request()
             logo = _load_logo_from_request()
@@ -745,6 +776,25 @@ def _parse_batch_form() -> tuple[dict[str, Any] | None, str | None]:
     name_by = (request.form.get("name_by") or "barcode").strip().lower()
     if symbol == "barcode" and name_by not in {"sequence", "barcode"}:
         return None, "name_by must be 'sequence' or 'barcode'"
+    save_as_qr_id = (request.form.get("save_as_qr_id") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    # Ticked by default: file names are 1, 2, 3. Unticked: 50001, 50002.
+    # An omitted field means the caller did not un-tick the box.
+    if "name_by_sequence" in request.form:
+        name_by_sequence = request.form.get("name_by_sequence", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    else:
+        name_by_sequence = True
+    if symbol != "barcode":
+        save_as_qr_id = not name_by_sequence
 
     # Validate the range up front so we can return a clean 400 before we
     # start rendering hundreds of QR codes.
@@ -772,6 +822,8 @@ def _parse_batch_form() -> tuple[dict[str, Any] | None, str | None]:
             "logo": logo,
             "symbol": symbol,
             "name_by": name_by,
+            "qr_id_start": qr_id_start,
+            "save_as_qr_id": save_as_qr_id,
         },
         None,
     )
@@ -905,8 +957,17 @@ def api_batch_stream() -> Response:
             border=parsed["border"],
             template_id=parsed["template_id"],
             logo=parsed["logo"],
+            id_start=parsed.get("qr_id_start"),
         )
-        packer = lambda src: iter_batch_with_progress(src, "zip_jpg")
+        sequence_ids, qr_ids = _sequence_map(parsed)
+        packer = lambda src: iter_batch_with_progress(
+            src,
+            "zip_jpg",
+            sequence_ids=sequence_ids,
+            qr_ids=qr_ids,
+            save_as_qr_id=parsed["save_as_qr_id"],
+            jpg_prefix=parsed["prefix"],
+        )
     else:
         # PNG batch: render at high resolution (box_size=40) for print
         items = generate_sequence(
@@ -921,6 +982,7 @@ def api_batch_stream() -> Response:
             border=parsed["border"],
             template_id=parsed["template_id"],
             logo=parsed["logo"],
+            id_start=parsed.get("qr_id_start"),
         )
         packer = lambda src: iter_batch_with_progress(src, fmt)
 

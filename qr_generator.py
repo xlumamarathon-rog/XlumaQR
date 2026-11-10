@@ -1440,6 +1440,7 @@ def generate_sequence(
     border: int = 4,
     template_id: str | None = None,
     logo: Image.Image | None = None,
+    id_start: int | None = None,
 ) -> Iterator[tuple[str, Image.Image]]:
     """Yield ``(filename, PIL.Image.Image)`` pairs for a sequential range.
 
@@ -1462,9 +1463,17 @@ def generate_sequence(
     unaffected.
     """
     numbers = compute_range(start, count=count, end=end, padding=padding)
-    for n in numbers:
-        data = data_template.replace("{n}", n)
-        label = label_template.replace("{n}", n) if label_template is not None else None
+    if id_start is None:
+        qr_ids = numbers
+    else:
+        qr_ids = compute_range(id_start, count=len(numbers), padding=padding)
+    for n, qr_id in zip(numbers, qr_ids):
+        data = data_template.replace("{n}", n).replace("{id}", qr_id)
+        label = (
+            label_template.replace("{n}", n).replace("{id}", qr_id)
+            if label_template is not None
+            else None
+        )
         image = generate_qr(
             data,
             label=label,
@@ -1621,18 +1630,48 @@ def _pack_zip(
     yield ("result", buffer.getvalue())
 
 
-def _pack_zip_jpg(items: Iterable[tuple[str, Image.Image]]) -> Iterator[tuple]:
-    """Pack QR images as high-quality JPEGs.
+def qr_mapping_xlsx(sequence_ids: list[str], qr_ids: list[str]) -> bytes:
+    """Spreadsheet pairing each sequence ID with the QR payload."""
+    import openpyxl
+    from openpyxl.styles import Font
 
-    JPEG has no alpha channel, so the render keeps its white background.
-    Quality 95 with no chroma subsampling keeps module edges sharp enough
-    to scan after a bib is printed. Filenames that arrived as ``.png``
-    are stored as ``.jpg``.
+    book = openpyxl.Workbook()
+    sheet = book.active
+    sheet.title = "QR Codes"
+    sheet.append(["Sequence", "QR ID"])
+    sheet["A1"].font = Font(bold=True)
+    sheet["B1"].font = Font(bold=True)
+    for sequence_id, qr_id in zip(sequence_ids, qr_ids):
+        sheet.append([sequence_id, qr_id])
+    sheet.column_dimensions["A"].width = 16
+    sheet.column_dimensions["B"].width = 28
+    buf = io.BytesIO()
+    book.save(buf)
+    return buf.getvalue()
+
+
+def _pack_zip_jpg(
+    items: Iterable[tuple[str, Image.Image]],
+    sequence_ids: list[str] | None = None,
+    qr_ids: list[str] | None = None,
+    save_as_qr_id: bool = False,
+    prefix: str = "",
+) -> Iterator[tuple]:
+    """Pack QR images as high-quality JPEGs plus the sequence map.
+
+    ``qr_mapping.xlsx`` lists the sequence ID beside the value encoded
+    in that QR. ``save_as_qr_id`` chooses the filename: the QR ID when
+    set, otherwise the sequence ID.
     """
     buffer = io.BytesIO()
+    sequence = list(sequence_ids or [])
+    encoded = list(qr_ids or [])
+    stems = encoded if save_as_qr_id else sequence
     with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
         for index, (filename, image) in enumerate(items):
-            if filename.lower().endswith(".png"):
+            if index < len(stems):
+                filename = f"{prefix}{stems[index]}.jpg"
+            elif filename.lower().endswith(".png"):
                 filename = filename[:-4] + ".jpg"
             jpg_buf = io.BytesIO()
             image.convert("RGB").save(
@@ -1645,6 +1684,11 @@ def _pack_zip_jpg(items: Iterable[tuple[str, Image.Image]]) -> Iterator[tuple]:
             )
             zf.writestr(filename, jpg_buf.getvalue())
             yield ("progress", index, filename)
+        if sequence:
+            zf.writestr(
+                "qr_mapping.xlsx",
+                qr_mapping_xlsx(sequence, encoded or sequence),
+            )
     yield ("result", buffer.getvalue())
 
 
@@ -1770,6 +1814,10 @@ def images_to_pdf(
 def iter_batch_with_progress(
     items: Iterable[tuple[str, Image.Image]],
     fmt: str,
+    sequence_ids: list[str] | None = None,
+    qr_ids: list[str] | None = None,
+    save_as_qr_id: bool = False,
+    jpg_prefix: str = "",
 ) -> Iterator[tuple]:
     """Pack ``items`` into a ZIP or PDF, yielding progress events lazily.
 
@@ -1830,7 +1878,13 @@ def iter_batch_with_progress(
     if fmt == "zip":
         yield from _pack_zip(items)
     elif fmt == "zip_jpg":
-        yield from _pack_zip_jpg(items)
+        yield from _pack_zip_jpg(
+            items,
+            sequence_ids=sequence_ids,
+            qr_ids=qr_ids,
+            save_as_qr_id=save_as_qr_id,
+            prefix=jpg_prefix,
+        )
     elif fmt == "pdf":
         yield from _pack_pdf(items)
     else:

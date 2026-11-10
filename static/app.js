@@ -756,8 +756,8 @@
     var labelTemplateEl = batchForm.elements["label_template"];
     var dataTemplate = dataTemplateEl ? dataTemplateEl.value : "";
     var labelTemplate = labelTemplateEl ? labelTemplateEl.value : "";
-    var dataValue = dataTemplate.split("{n}").join(paddedFirst);
-    var labelValue = labelTemplate.split("{n}").join(paddedFirst);
+    var dataValue = dataTemplate.split("{n}").join(paddedFirst).split("{id}").join(paddedFirst);
+    var labelValue = labelTemplate.split("{n}").join(paddedFirst).split("{id}").join(paddedFirst);
 
     if (!dataValue) {
       setBatchPreviewMessage(
@@ -918,6 +918,13 @@
       if (barcode) design.setAttribute("hidden", "");
       else design.removeAttribute("hidden");
     }
+    var qrIdOptions = document.getElementById("batch-qr-id-options");
+    if (qrIdOptions) {
+      if (barcode) qrIdOptions.setAttribute("hidden", "");
+      else qrIdOptions.removeAttribute("hidden");
+    }
+    var startLabel = document.getElementById("batch-start-label");
+    if (startLabel) startLabel.textContent = barcode ? "Start number" : "Sequence ID start";
     var barcodeOptions = document.getElementById("batch-barcode-options");
     if (barcodeOptions) {
       if (barcode) barcodeOptions.removeAttribute("hidden");
@@ -1003,7 +1010,7 @@
     var lastStr = paddingVal > 0 ? pad(lastN, paddingVal) : String(lastN);
 
     batchHint.classList.remove("error");
-    batchHint.textContent =
+    var rangeText =
       "Will generate " +
       count +
       " " +
@@ -1011,7 +1018,12 @@
       ": " +
       firstStr +
       " -> " +
-      lastStr;
+      lastStr +
+      ".";
+    if (currentSymbol() !== "barcode") {
+      rangeText += " Sequence 1 -> " + count + ". QR ID " + firstStr + " -> " + lastStr + ".";
+    }
+    batchHint.textContent = rangeText;
   }
 
   if (batchForm) {
@@ -1060,6 +1072,12 @@
       if (currentSymbol() === "barcode") {
         var nameBy = batchForm.querySelector('input[name="name_by"]:checked');
         formData.set("name_by", nameBy ? nameBy.value : "barcode");
+      } else {
+        var nameBySequence = document.getElementById("name-by-sequence");
+        formData.set(
+          "name_by_sequence",
+          nameBySequence && nameBySequence.checked ? "yes" : "no"
+        );
       }
       if (mode === "count") {
         formData.set("count", batchForm.elements["count"].value);

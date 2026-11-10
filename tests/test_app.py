@@ -1718,8 +1718,57 @@ def test_batch_format_zip_jpg_returns_jpegs(client) -> None:
     assert rv.mimetype == "application/zip"
     assert "qr_batch_1001_1002_jpg.zip" in rv.headers["Content-Disposition"]
     with zipfile.ZipFile(io.BytesIO(rv.data)) as zf:
-        assert zf.namelist() == ["qr_1001.jpg", "qr_1002.jpg"]
-        for name in zf.namelist():
+        assert zf.namelist() == ["qr_1.jpg", "qr_2.jpg", "qr_mapping.xlsx"]
+        for name in ("qr_1.jpg", "qr_2.jpg"):
             jpg = zf.read(name)
             assert jpg[:3] == b"\xff\xd8\xff"
             assert len(jpg) > 8000
+        _assert_qr_mapping(
+            zf.read("qr_mapping.xlsx"),
+            [("1", "1001"), ("2", "1002")],
+        )
+
+
+def _assert_qr_mapping(raw: bytes, rows: list[tuple[str, str]]) -> None:
+    import openpyxl
+
+    sheet = openpyxl.load_workbook(io.BytesIO(raw)).active
+    assert sheet["A1"].value == "Sequence"
+    assert sheet["B1"].value == "QR ID"
+    for index, (sequence_id, qr_id) in enumerate(rows, start=2):
+        assert str(sheet.cell(index, 1).value) == sequence_id
+        assert str(sheet.cell(index, 2).value) == qr_id
+
+
+def test_batch_jpg_sequence_names_and_qr_ids(client) -> None:
+    rv = client.post(
+        "/api/qr/batch",
+        data={
+            "start": "50001",
+            "count": "2",
+            "format": "zip_jpg",
+            "symbol": "qr",
+            "name_by_sequence": "yes",
+        },
+    )
+    assert rv.status_code == 200, rv.get_json()
+    with zipfile.ZipFile(io.BytesIO(rv.data)) as zf:
+        assert zf.namelist()[:2] == ["1.jpg", "2.jpg"]
+        _assert_qr_mapping(
+            zf.read("qr_mapping.xlsx"),
+            [("1", "50001"), ("2", "50002")],
+        )
+
+    named_by_id = client.post(
+        "/api/qr/batch",
+        data={
+            "start": "50001",
+            "count": "2",
+            "format": "zip_jpg",
+            "symbol": "qr",
+            "name_by_sequence": "no",
+        },
+    )
+    assert named_by_id.status_code == 200, named_by_id.get_json()
+    with zipfile.ZipFile(io.BytesIO(named_by_id.data)) as zf:
+        assert zf.namelist()[:2] == ["50001.jpg", "50002.jpg"]

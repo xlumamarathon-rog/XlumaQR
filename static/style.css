@@ -219,6 +219,11 @@ fieldset {
   gap: 8px;
 }
 
+/* Author display rules must not override the hidden attribute. */
+[hidden] {
+  display: none !important;
+}
+
 fieldset legend {
   font-size: 0.72rem;
   font-weight: 600;
