@@ -1772,3 +1772,50 @@ def test_batch_jpg_sequence_names_and_qr_ids(client) -> None:
     assert named_by_id.status_code == 200, named_by_id.get_json()
     with zipfile.ZipFile(io.BytesIO(named_by_id.data)) as zf:
         assert zf.namelist()[:2] == ["50001.jpg", "50002.jpg"]
+
+
+def test_sequence_names_pad_to_the_total() -> None:
+    from app import _sequence_map
+
+    sequence, qr_ids = _sequence_map(
+        {
+            "start": 50001,
+            "count": 1000,
+            "end": None,
+            "padding": 0,
+            "data_template": "{n}",
+            "pad_sequence_names": True,
+        }
+    )
+    assert sequence[0] == "0001"
+    assert sequence[9] == "0010"
+    assert sequence[998] == "0999"
+    assert sequence[-1] == "1000"
+    assert qr_ids[0] == "50001"
+    assert qr_ids[-1] == "51000"
+
+
+def test_batch_jpg_pads_sequence_filenames(client) -> None:
+    rv = client.post(
+        "/api/qr/batch",
+        data={
+            "start": "50001",
+            "count": "10",
+            "format": "zip_jpg",
+            "symbol": "qr",
+            "name_by_sequence": "yes",
+            "pad_sequence_names": "yes",
+        },
+    )
+    assert rv.status_code == 200, rv.get_json()
+    with zipfile.ZipFile(io.BytesIO(rv.data)) as zf:
+        names = [name for name in zf.namelist() if name.endswith(".jpg")]
+        assert names[0] == "01.jpg"
+        assert names[-1] == "10.jpg"
+        import openpyxl
+
+        sheet = openpyxl.load_workbook(io.BytesIO(zf.read("qr_mapping.xlsx"))).active
+        assert str(sheet.cell(2, 1).value) == "01"
+        assert str(sheet.cell(2, 2).value) == "50001"
+        assert str(sheet.cell(11, 1).value) == "10"
+        assert str(sheet.cell(11, 2).value) == "50010"

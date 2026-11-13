@@ -688,7 +688,11 @@ def _sequence_map(parsed: dict[str, Any]) -> tuple[list[str], list[str]]:
     )
     template = parsed["data_template"]
     encoded = [template.replace("{n}", n).replace("{id}", n) for n in qr_numbers]
-    sequence = [str(index) for index in range(1, len(qr_numbers) + 1)]
+    width = len(str(len(qr_numbers))) if parsed.get("pad_sequence_names") else 0
+    sequence = [
+        str(index).zfill(width) if width > 1 else str(index)
+        for index in range(1, len(qr_numbers) + 1)
+    ]
     return sequence, encoded
 
 
@@ -795,6 +799,15 @@ def _parse_batch_form() -> tuple[dict[str, Any] | None, str | None]:
         name_by_sequence = True
     if symbol != "barcode":
         save_as_qr_id = not name_by_sequence
+    if "pad_sequence_names" in request.form:
+        pad_sequence_names = request.form.get("pad_sequence_names", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    else:
+        pad_sequence_names = False
 
     # Validate the range up front so we can return a clean 400 before we
     # start rendering hundreds of QR codes.
@@ -824,6 +837,7 @@ def _parse_batch_form() -> tuple[dict[str, Any] | None, str | None]:
             "name_by": name_by,
             "qr_id_start": qr_id_start,
             "save_as_qr_id": save_as_qr_id,
+            "pad_sequence_names": pad_sequence_names,
         },
         None,
     )

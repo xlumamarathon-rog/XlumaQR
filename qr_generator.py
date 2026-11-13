@@ -1641,8 +1641,12 @@ def qr_mapping_xlsx(sequence_ids: list[str], qr_ids: list[str]) -> bytes:
     sheet.append(["Sequence", "QR ID"])
     sheet["A1"].font = Font(bold=True)
     sheet["B1"].font = Font(bold=True)
-    for sequence_id, qr_id in zip(sequence_ids, qr_ids):
-        sheet.append([sequence_id, qr_id])
+    for row_index, (sequence_id, qr_id) in enumerate(
+        zip(sequence_ids, qr_ids), start=2
+    ):
+        sequence_cell = sheet.cell(row_index, 1, sequence_id)
+        sequence_cell.number_format = "@"
+        sheet.cell(row_index, 2, qr_id)
     sheet.column_dimensions["A"].width = 16
     sheet.column_dimensions["B"].width = 28
     buf = io.BytesIO()

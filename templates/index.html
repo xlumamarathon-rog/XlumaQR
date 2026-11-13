@@ -7,7 +7,7 @@
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>◼</text></svg>">
     <link
       rel="stylesheet"
-      href="{{ url_for('static', filename='style.css') }}?v=seq-names"
+      href="{{ url_for('static', filename='style.css') }}?v=pad-seq"
     />
   </head>
   <body>
@@ -254,10 +254,20 @@
                 />
                 Name files by sequence number (1, 2, 3)
               </label>
+              <label>
+                <input
+                  type="checkbox"
+                  id="pad-sequence-names"
+                  name="pad_sequence_names"
+                  value="yes"
+                />
+                Pad sequence file names to the total (0001, 0010, 1000)
+              </label>
               <p class="format-toggle-note">
                 Sequence ID start is the QR ID. Start 50001 encodes 50001, 50002, …
                 The sheet lists sequence 1, 2, 3 beside those QR IDs.
                 Ticked saves 1.jpg, 2.jpg, 3.jpg. Unticked saves 50001.jpg, 50002.jpg.
+                Pad uses the digit length of the total: 1000 codes become 0001, 0010, 0999, 1000.
               </p>
             </fieldset>
           </div>
@@ -583,6 +593,6 @@
       </section>
     </main>
 
-    <script src="{{ url_for('static', filename='app.js') }}?v=seq-names"></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=pad-seq"></script>
   </body>
 </html>

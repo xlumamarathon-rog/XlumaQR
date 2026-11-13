@@ -1078,6 +1078,11 @@
           "name_by_sequence",
           nameBySequence && nameBySequence.checked ? "yes" : "no"
         );
+        var padSequence = document.getElementById("pad-sequence-names");
+        formData.set(
+          "pad_sequence_names",
+          padSequence && padSequence.checked ? "yes" : "no"
+        );
       }
       if (mode === "count") {
         formData.set("count", batchForm.elements["count"].value);
